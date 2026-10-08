@@ -29,6 +29,7 @@ class Sequence:
         self.num_prompt_tokens = len(self.token_ids)
         # num_cached_tokens = 0
         self.num_cached_tokens = 0
+        self.num_computed_tokens = 0
         # block_table
         self.block_table = []
         # sampling_params' related things
@@ -50,6 +51,10 @@ class Sequence:
     @property
     def num_completion_tokens(self):
         return self.num_tokens - self.num_prompt_tokens
+
+    @property
+    def num_uncomputed_tokens(self):
+        return self.num_tokens - self.num_computed_tokens
 
     @property
     def prompt_token_ids(self):
@@ -85,30 +90,44 @@ class Sequence:
         self.last_token = token_id
         self.num_tokens += 1 
 
+    def advance_computed_tokens(self, count: int):
+        if count < 0:
+            raise ValueError("Computed token count must be non-negative")
+
+        new_num_computed_tokens = self.num_computed_tokens + count
+        if new_num_computed_tokens > self.num_tokens:
+            raise ValueError(
+                "Computed token count cannot exceed the number of known tokens"
+            )
+
+        self.num_computed_tokens = new_num_computed_tokens
+
     def __getstate__(self):
         return (
-            self.num_tokens, 
-            self.num_prompt_tokens, 
-            self.num_cached_tokens, 
+            self.block_size,
+            self.num_tokens,
+            self.num_prompt_tokens,
+            self.num_cached_tokens,
+            self.num_computed_tokens,
             self.block_table,
-            self.token_ids if self.num_completion_tokens == 0 else self.last_token
+            self.token_ids if self.num_completion_tokens == 0 else self.last_token,
         )
 
     def __setstate__(self, state):
         (
+            self.block_size,
             self.num_tokens,
             self.num_prompt_tokens,
             self.num_cached_tokens,
+            self.num_computed_tokens,
             self.block_table,
-            last_token_or_ids
+            last_token_or_ids,
         ) = state
-        # Check if this is prefill (num_completion_tokens == 0) or decode phase
+
         num_completion_tokens = self.num_tokens - self.num_prompt_tokens
         if num_completion_tokens == 0:
-            # Prefill: last_token_or_ids is the full token_ids list
             self.token_ids = last_token_or_ids
         else:
-            # Decode: last_token_or_ids is just the last token
             self.token_ids = [last_token_or_ids]
-        # Restore last_token attribute
+
         self.last_token = self.token_ids[-1] if self.token_ids else None
