@@ -66,24 +66,41 @@ class LLMEngine:
     # call model_runner.run() to run the model
     # call postprocessor to process the outputs and update sequences and update block manager
     def step(self) -> tuple[list[tuple[int, list[int]]], int, bool]:
-        scheduled_sequences, is_prefill = self.scheduler.schedule()
+        scheduled = self.scheduler.schedule()
         num_processed_tokens = 0
-        if not scheduled_sequences:
-            return [], num_processed_tokens, is_prefill
-        # run the model
-        outputs = self.model_runner.call("run", scheduled_sequences, is_prefill)
-        # Move outputs to CPU and convert them to a list
+
+        if not scheduled:
+            return [], num_processed_tokens, False
+
+        is_prefill = scheduled[0].is_prefill
+        if any(item.is_prefill != is_prefill for item in scheduled):
+            raise RuntimeError(
+                "Mixed prefill/decode batches are not supported by ModelRunner yet"
+            )
+
+        scheduled_sequences = [item.sequence for item in scheduled]
+
+        outputs = self.model_runner.call(
+            "run",
+            scheduled_sequences,
+            is_prefill,
+        )
+
         if outputs is not None:
             outputs = outputs.cpu().tolist()
-        # postprocess the outputs
+
         self.scheduler.postprocess(scheduled_sequences, outputs)
 
-        outputs = [(seq.seq_id, seq.completion_token_ids) for seq in scheduled_sequences if seq.is_finished]
-        num_processed_tokens = sum(len(seq) for seq in scheduled_sequences) if is_prefill else len(scheduled_sequences)
+        outputs = [
+            (seq.seq_id, seq.completion_token_ids)
+            for seq in scheduled_sequences
+            if seq.is_finished
+        ]
+        num_processed_tokens = sum(
+            item.num_scheduled_tokens for item in scheduled
+        )
 
         return outputs, num_processed_tokens, is_prefill
-
-
     # add prompt string to the waiting queue by first transforming it to Sequence object
     def add_prompt(self, prompt: str, sampling_params: SamplingParams) -> None:
         self.scheduler.add_sequence(Sequence(token_ids=self.tokenizer.encode(prompt), block_size=self.config['block_size'],sampling_params=sampling_params))

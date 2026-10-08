@@ -39,6 +39,11 @@ def all_tracked(scheduler: Scheduler, scheduled: list[Sequence]) -> set:
     """Return the set of all sequences the scheduler currently knows about."""
     return set(scheduler.running) | set(scheduler.waiting) | set(scheduled)
 
+def schedule_sequences(scheduler: Scheduler):
+    scheduled = scheduler.schedule()
+    sequences = [item.sequence for item in scheduled]
+    is_prefill = scheduled[0].is_prefill if scheduled else False
+    return sequences, is_prefill
 
 class TestBug2TokenLimitBreak:
     """
@@ -59,7 +64,7 @@ class TestBug2TokenLimitBreak:
         scheduler.block_manager.can_append.return_value = True
         scheduler.block_manager.append.return_value = None
 
-        scheduled, is_prefill = scheduler.schedule()
+        scheduled, is_prefill = schedule_sequences(scheduler)
 
         return seq_a, seq_b, seq_c, scheduled, is_prefill
 
@@ -123,7 +128,7 @@ class TestBug1CanAppendFailure:
         mock_bm.deallocate.return_value = None
         scheduler.block_manager = mock_bm
 
-        scheduled, is_prefill = scheduler.schedule()
+        scheduled, is_prefill = schedule_sequences(scheduler)
         return seq_a, seq_b, scheduled, is_prefill
 
     def test_seq_a_not_lost(self):
@@ -153,7 +158,7 @@ class TestSchedulerHappyPath:
         seq = make_sequence([1, 2, 3, 4])
         scheduler.add_sequence(seq)
 
-        scheduled, is_prefill = scheduler.schedule()
+        scheduled, is_prefill = schedule_sequences(scheduler)
         assert is_prefill
         assert seq in scheduled
         assert seq in scheduler.running
@@ -168,7 +173,7 @@ class TestSchedulerHappyPath:
         scheduler.block_manager.can_append.return_value = True
         scheduler.block_manager.append.return_value = None
 
-        scheduled, is_prefill = scheduler.schedule()
+        scheduled, is_prefill = schedule_sequences(scheduler)
         assert not is_prefill
         assert len(scheduled) == 2
         # Both should be back in running after schedule()
@@ -185,8 +190,24 @@ class TestSchedulerHappyPath:
         scheduler.block_manager.can_append.return_value = False
         scheduler.block_manager.deallocate.return_value = None
 
-        scheduled, is_prefill = scheduler.schedule()
+        scheduled, is_prefill = schedule_sequences(scheduler)
         assert not is_prefill
         assert len(scheduled) == 0
         assert seq in scheduler.waiting
         assert seq.status == SequenceStatus.WAITING
+    def test_schedule_reports_per_sequence_work(self):
+        scheduler = make_scheduler(
+            max_num_batched_tokens=100,
+            max_cached_blocks=50,
+        )
+        seq = make_sequence([1, 2, 3, 4])
+        scheduler.add_sequence(seq)
+
+        scheduled = scheduler.schedule()
+
+        assert len(scheduled) == 1
+
+        item = scheduled[0]
+        assert item.sequence is seq
+        assert item.num_scheduled_tokens == 4
+        assert item.is_prefill

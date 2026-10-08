@@ -1,6 +1,17 @@
+from dataclasses import dataclass
 from collections import deque
 from myvllm.engine.sequence import Sequence, SequenceStatus
 from myvllm.engine.block_manager import BlockManager
+
+@dataclass(frozen=True)
+class ScheduledSequence:
+    sequence: Sequence
+    num_scheduled_tokens: int
+    is_prefill: bool
+
+    def __post_init__(self):
+        if self.num_scheduled_tokens <= 0:
+            raise ValueError("num_scheduled_tokens must be positive")
 
 
 class Scheduler:
@@ -32,7 +43,7 @@ class Scheduler:
         self.waiting.append(sequence)
 
 
-    def schedule(self) -> tuple[list[Sequence], bool]:
+    def schedule(self) -> list[ScheduledSequence]:
         scheduled_sequences = []
         current_scheduled_tokens = 0
         # An empty schedule is only legitimate when this call freed blocks by
@@ -51,7 +62,14 @@ class Scheduler:
             else:
                 break
         if scheduled_sequences:
-            return scheduled_sequences, True
+            return [
+                ScheduledSequence(
+                    sequence=seq,
+                    num_scheduled_tokens=len(seq),
+                    is_prefill=True,
+                )
+                for seq in scheduled_sequences
+            ]
         
         # try schedule for completion from running queue
         while self.running:
@@ -90,7 +108,14 @@ class Scheduler:
                 "blocks leaked because their ref_count never returned to 0."
             )
 
-        return scheduled_sequences, False
+        return [
+            ScheduledSequence(
+                sequence=seq,
+                num_scheduled_tokens=1,
+                is_prefill=False,
+            )
+            for seq in scheduled_sequences
+        ]
 
 
     def preempt(self, seq: Sequence) -> None:
