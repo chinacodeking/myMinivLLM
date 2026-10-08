@@ -29,8 +29,12 @@ def make_scheduler(
 
 
 def inject_running(scheduler: Scheduler, *seqs: Sequence):
-    """Put sequences directly into the running queue, bypassing prefill."""
+    """Put sequences into running with their prompt already computed."""
     for seq in seqs:
+        remaining_prompt_tokens = (
+            seq.num_prompt_tokens - seq.num_computed_tokens
+        )
+        seq.advance_computed_tokens(remaining_prompt_tokens)
         seq.status = SequenceStatus.RUNNING
         scheduler.running.append(seq)
 
@@ -151,6 +155,40 @@ class TestBug1CanAppendFailure:
         assert seq_a in tracked, f"seq_a disappeared"
         assert seq_b in tracked, f"seq_b disappeared"
 
+class TestChunkedPrefill:
+    def test_long_prompt_is_split_across_steps(self):
+        scheduler = make_scheduler(
+            max_num_batched_tokens=4,
+            max_cached_blocks=10,
+            block_size=4,
+        )
+        seq = make_sequence(
+            list(range(1, 11)),
+            block_size=4,
+        )
+        scheduler.add_sequence(seq)
+
+        completed_tokens = 0
+
+        for expected_chunk_size in (4, 4, 2):
+            scheduled = scheduler.schedule()
+
+            assert len(scheduled) == 1
+
+            item = scheduled[0]
+            assert item.sequence is seq
+            assert item.is_prefill
+            assert item.num_scheduled_tokens == expected_chunk_size
+
+            assert seq.num_computed_tokens == completed_tokens
+
+            seq.advance_computed_tokens(expected_chunk_size)
+            completed_tokens += expected_chunk_size
+
+        assert completed_tokens == 10
+        assert seq.num_computed_tokens == seq.num_prompt_tokens
+        assert seq in scheduler.running
+        assert seq not in scheduler.waiting
 
 class TestSchedulerHappyPath:
     def test_prefill_scheduled_first(self):

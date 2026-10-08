@@ -78,6 +78,20 @@ class LLMEngine:
                 "Mixed prefill/decode batches are not supported by ModelRunner yet"
             )
 
+        has_partial_prefill = any(
+            item.is_prefill
+            and item.num_scheduled_tokens
+            != (
+                item.sequence.num_prompt_tokens
+                - item.sequence.num_computed_tokens
+            )
+            for item in scheduled
+        )
+        if has_partial_prefill:
+            raise RuntimeError(
+                "Chunked prefill execution is not supported by ModelRunner yet"
+            )
+
         scheduled_sequences = [item.sequence for item in scheduled]
 
         outputs = self.model_runner.call(
@@ -88,6 +102,12 @@ class LLMEngine:
 
         if outputs is not None:
             outputs = outputs.cpu().tolist()
+
+        # Commit progress only after model execution succeeds.
+        for item in scheduled:
+            item.sequence.advance_computed_tokens(
+                item.num_scheduled_tokens
+            )
 
         self.scheduler.postprocess(scheduled_sequences, outputs)
 

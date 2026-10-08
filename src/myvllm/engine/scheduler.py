@@ -44,33 +44,85 @@ class Scheduler:
 
 
     def schedule(self) -> list[ScheduledSequence]:
-        scheduled_sequences = []
+        scheduled_sequences: list[Sequence] = []
         current_scheduled_tokens = 0
-        # An empty schedule is only legitimate when this call freed blocks by
-        # preempting, so the next call can make progress. See the guard below.
         preempted = False
-        # try schedule for prefilling from waiting queue if not exceeding limits
-        while self.waiting and len(scheduled_sequences) < self.max_num_sequences:
-            seq = self.waiting[0]
-            if self.block_manager.can_allocate(seq) and len(seq) + current_scheduled_tokens <= self.max_num_batched_tokens:
-                seq = self.waiting.popleft() # remove from waiting
-                self.block_manager.allocate(seq)
-                seq.status = SequenceStatus.RUNNING
-                self.running.append(seq)
-                scheduled_sequences.append(seq)
-                current_scheduled_tokens += len(seq)
-            else:
+
+        scheduled_prefills: list[ScheduledSequence] = []
+
+        # Resume prompts that were partially computed in an earlier step.
+        for seq in self.running:
+            if len(scheduled_prefills) >= self.max_num_sequences:
                 break
-        if scheduled_sequences:
-            return [
+
+            remaining_budget = (
+                self.max_num_batched_tokens - current_scheduled_tokens
+            )
+            if remaining_budget <= 0:
+                break
+
+            num_uncomputed_prompt_tokens = (
+                seq.num_prompt_tokens - seq.num_computed_tokens
+            )
+            if num_uncomputed_prompt_tokens <= 0:
+                continue
+
+            num_scheduled_tokens = min(
+                num_uncomputed_prompt_tokens,
+                remaining_budget,
+            )
+            scheduled_prefills.append(
                 ScheduledSequence(
                     sequence=seq,
-                    num_scheduled_tokens=len(seq),
+                    num_scheduled_tokens=num_scheduled_tokens,
                     is_prefill=True,
                 )
-                for seq in scheduled_sequences
-            ]
-        
+            )
+            current_scheduled_tokens += num_scheduled_tokens
+
+        if scheduled_prefills:
+            return scheduled_prefills
+
+        # Admit new prompts from the waiting queue.
+        while (
+            self.waiting
+            and len(scheduled_prefills) < self.max_num_sequences
+            and current_scheduled_tokens < self.max_num_batched_tokens
+        ):
+            seq = self.waiting[0]
+            if not self.block_manager.can_allocate(seq):
+                break
+
+            remaining_budget = (
+                self.max_num_batched_tokens - current_scheduled_tokens
+            )
+            num_uncomputed_prompt_tokens = (
+                seq.num_prompt_tokens - seq.num_computed_tokens
+            )
+            num_scheduled_tokens = min(
+                num_uncomputed_prompt_tokens,
+                remaining_budget,
+            )
+            if num_scheduled_tokens <= 0:
+                break
+
+            seq = self.waiting.popleft()
+            self.block_manager.allocate(seq)
+            seq.status = SequenceStatus.RUNNING
+            self.running.append(seq)
+
+            scheduled_prefills.append(
+                ScheduledSequence(
+                    sequence=seq,
+                    num_scheduled_tokens=num_scheduled_tokens,
+                    is_prefill=True,
+                )
+            )
+            current_scheduled_tokens += num_scheduled_tokens
+
+        if scheduled_prefills:
+            return scheduled_prefills
+
         # try schedule for completion from running queue
         while self.running:
             seq = self.running.popleft()
