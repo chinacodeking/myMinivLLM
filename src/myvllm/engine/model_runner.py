@@ -460,6 +460,12 @@ class ModelRunner:
 
         seqs = [item.sequence for item in scheduled]
 
+        sampling_sequences = [
+            item.sequence
+            for item in scheduled
+            if item.should_sample
+        ]
+
         if is_prefill:
             input_ids = self.prepare_prefill(scheduled)
         else:
@@ -470,10 +476,24 @@ class ModelRunner:
         # only sample when rank == 0
         token_ids = None
         if self.rank == 0:
-            token_ids = self.sampler(
+            sample_logits = select_sample_logits(
                 logits,
-                self.prepare_sample(seqs),
+                scheduled,
             )
+
+            if sampling_sequences:
+                token_ids = self.sampler(
+                    sample_logits,
+                    self.prepare_sample(
+                        sampling_sequences
+                    ),
+                )
+            else:
+                token_ids = torch.empty(
+                    0,
+                    dtype=torch.long,
+                    device=logits.device,
+                )
 
         reset_context()
         return token_ids

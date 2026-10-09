@@ -18,7 +18,9 @@ def make_sequence(token_ids, block_size=4):
 
 
 def test_run_reads_phase_and_sequences_from_scheduled_work():
-    seq = make_sequence([1, 2, 3])
+    seq = make_sequence(
+        [1, 2, 3]
+    )
     scheduled = [
         ScheduledSequence(
             sequence=seq,
@@ -27,30 +29,62 @@ def test_run_reads_phase_and_sequences_from_scheduled_work():
         )
     ]
 
-    runner = ModelRunner.__new__(ModelRunner)
+    runner = ModelRunner.__new__(
+        ModelRunner
+    )
     runner.rank = 0
 
     input_ids = object()
-    logits = object()
+    logits = torch.arange(
+        6,
+        dtype=torch.float32,
+    ).reshape(
+        3,
+        2,
+    )
     temperatures = object()
     sampled_token_ids = object()
 
-    runner.prepare_prefill = MagicMock(return_value=input_ids)
-    runner.prepare_decode = MagicMock()
-    runner.run_model = MagicMock(return_value=logits)
-    runner.prepare_sample = MagicMock(return_value=temperatures)
-    runner.sampler = MagicMock(return_value=sampled_token_ids)
-
-    outputs = runner.run(scheduled)
-
-    runner.prepare_prefill.assert_called_once_with(scheduled)
-    runner.prepare_decode.assert_not_called()
-    runner.run_model.assert_called_once_with(input_ids, True)
-    runner.prepare_sample.assert_called_once_with([seq])
-    runner.sampler.assert_called_once_with(
-        logits,
-        temperatures,
+    runner.prepare_prefill = MagicMock(
+        return_value=input_ids
     )
+    runner.prepare_decode = MagicMock()
+    runner.run_model = MagicMock(
+        return_value=logits
+    )
+    runner.prepare_sample = MagicMock(
+        return_value=temperatures
+    )
+    runner.sampler = MagicMock(
+        return_value=sampled_token_ids
+    )
+
+    outputs = runner.run(
+        scheduled
+    )
+
+    runner.prepare_prefill.assert_called_once_with(
+        scheduled
+    )
+    runner.prepare_decode.assert_not_called()
+    runner.run_model.assert_called_once_with(
+        input_ids,
+        True,
+    )
+    runner.prepare_sample.assert_called_once_with(
+        [seq]
+    )
+    runner.sampler.assert_called_once()
+
+    sampled_logits, sampled_temperatures = (
+        runner.sampler.call_args.args
+    )
+
+    torch.testing.assert_close(
+        sampled_logits,
+        logits[2:3],
+    )
+    assert sampled_temperatures is temperatures
     assert outputs is sampled_token_ids
 def test_prepare_prefill_builds_metadata_from_scheduled_work(
     monkeypatch,
@@ -484,3 +518,141 @@ class TestSampleLogitSelection:
             3,
         )
         assert selected.dtype == logits.dtype
+def test_run_samples_only_sequences_that_reach_sampling_boundary():
+    intermediate = make_sequence(
+        [1, 2, 3, 4]
+    )
+    complete = make_sequence(
+        [5, 6, 7]
+    )
+    scheduled = [
+        ScheduledSequence(
+            sequence=intermediate,
+            num_scheduled_tokens=2,
+            is_prefill=True,
+        ),
+        ScheduledSequence(
+            sequence=complete,
+            num_scheduled_tokens=3,
+            is_prefill=True,
+        ),
+    ]
+
+    runner = ModelRunner.__new__(
+        ModelRunner
+    )
+    runner.rank = 0
+
+    input_ids = torch.tensor(
+        [1, 2, 5, 6, 7],
+        dtype=torch.long,
+    )
+    logits = torch.arange(
+        10,
+        dtype=torch.float32,
+    ).reshape(
+        5,
+        2,
+    )
+    temperatures = torch.tensor(
+        [0.7],
+        dtype=torch.float32,
+    )
+    sampled_tokens = torch.tensor(
+        [9],
+        dtype=torch.long,
+    )
+
+    runner.prepare_prefill = MagicMock(
+        return_value=input_ids
+    )
+    runner.prepare_decode = MagicMock()
+    runner.run_model = MagicMock(
+        return_value=logits
+    )
+    runner.prepare_sample = MagicMock(
+        return_value=temperatures
+    )
+    runner.sampler = MagicMock(
+        return_value=sampled_tokens
+    )
+
+    result = runner.run(
+        scheduled
+    )
+
+    runner.prepare_prefill.assert_called_once_with(
+        scheduled
+    )
+    runner.prepare_decode.assert_not_called()
+    runner.prepare_sample.assert_called_once_with(
+        [complete]
+    )
+
+    sampled_logits, sampled_temperatures = (
+        runner.sampler.call_args.args
+    )
+
+    torch.testing.assert_close(
+        sampled_logits,
+        logits[4:5],
+    )
+    assert sampled_temperatures is temperatures
+    assert result is sampled_tokens
+
+
+def test_run_skips_sampler_for_intermediate_prefill():
+    seq = make_sequence(
+        [1, 2, 3, 4]
+    )
+    scheduled = [
+        ScheduledSequence(
+            sequence=seq,
+            num_scheduled_tokens=2,
+            is_prefill=True,
+        )
+    ]
+
+    runner = ModelRunner.__new__(
+        ModelRunner
+    )
+    runner.rank = 0
+
+    input_ids = torch.tensor(
+        [1, 2],
+        dtype=torch.long,
+    )
+    logits = torch.arange(
+        6,
+        dtype=torch.float32,
+    ).reshape(
+        2,
+        3,
+    )
+
+    runner.prepare_prefill = MagicMock(
+        return_value=input_ids
+    )
+    runner.prepare_decode = MagicMock()
+    runner.run_model = MagicMock(
+        return_value=logits
+    )
+    runner.prepare_sample = MagicMock()
+    runner.sampler = MagicMock()
+
+    result = runner.run(
+        scheduled
+    )
+
+    runner.prepare_prefill.assert_called_once_with(
+        scheduled
+    )
+    runner.prepare_decode.assert_not_called()
+    runner.prepare_sample.assert_not_called()
+    runner.sampler.assert_not_called()
+
+    assert result.shape == (
+        0,
+    )
+    assert result.dtype is torch.long
+    assert result.device == logits.device
