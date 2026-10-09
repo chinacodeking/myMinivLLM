@@ -350,6 +350,10 @@ class ModelRunner:
         for i, seq in enumerate(seqs):
             block_table = seq.block_table + [-1]*(max_num_blocks - len(seq.block_table))
             block_tables.append(block_table)
+        positions = [
+            context_len - 1
+            for context_len in context_lens
+        ]
         input_ids = torch.tensor(input_ids, dtype=torch.long, pin_memory=True).cuda(non_blocking=True)
         set_context(
             is_prefill=False,
@@ -360,6 +364,11 @@ class ModelRunner:
             slot_mapping=torch.tensor(slot_mappings, dtype=torch.long, pin_memory=True).cuda(non_blocking=True),
             context_lens=torch.tensor(context_lens, dtype=torch.long, pin_memory=True).cuda(non_blocking=True),
             block_tables=torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True) if block_tables else None,
+            positions=torch.tensor(
+                positions,
+                dtype=torch.long,
+                pin_memory=True,
+            ).cuda(non_blocking=True),
         )
         return input_ids    
 

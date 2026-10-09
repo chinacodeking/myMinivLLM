@@ -158,3 +158,54 @@ def test_prepare_prefill_puts_absolute_positions_in_context(
     context_arguments = fake_set_context.call_args.kwargs
 
     assert context_arguments["positions"].values == [4, 5]
+def test_prepare_decode_puts_last_token_positions_in_context(
+    monkeypatch,
+):
+    first = make_sequence([1, 2, 3, 4, 5])
+    first.block_table = [7, 2]
+
+    second = make_sequence([8, 9, 10])
+    second.block_table = [4]
+
+    runner = ModelRunner.__new__(ModelRunner)
+    runner.block_size = 4
+
+    class FakeTensor:
+        def __init__(
+            self,
+            values,
+            **kwargs,
+        ):
+            self.values = list(values)
+            self.options = kwargs
+
+        def cuda(
+            self,
+            non_blocking,
+        ):
+            assert non_blocking
+            return self
+
+    fake_set_context = MagicMock()
+
+    monkeypatch.setattr(
+        model_runner_module.torch,
+        "tensor",
+        FakeTensor,
+    )
+    monkeypatch.setattr(
+        model_runner_module,
+        "set_context",
+        fake_set_context,
+    )
+
+    input_ids = runner.prepare_decode(
+        [first, second]
+    )
+
+    assert input_ids.values == [5, 10]
+
+    context_arguments = fake_set_context.call_args.kwargs
+
+    assert context_arguments["context_lens"].values == [5, 3]
+    assert context_arguments["positions"].values == [4, 2]
