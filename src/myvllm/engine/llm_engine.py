@@ -65,7 +65,9 @@ class LLMEngine:
     # return scheduled sequences and whether it is for prefilling
     # call model_runner.run() to run the model
     # call postprocessor to process the outputs and update sequences and update block manager
-    def step(self) -> tuple[list[tuple[int, list[int]]], int, bool]:
+    def step(
+        self,
+    ) -> tuple[list[tuple[int, list[int]]], int, bool]:
         scheduled = self.scheduler.schedule()
         num_processed_tokens = 0
 
@@ -73,54 +75,72 @@ class LLMEngine:
             return [], num_processed_tokens, False
 
         is_prefill = scheduled[0].is_prefill
-        if any(item.is_prefill != is_prefill for item in scheduled):
-            raise RuntimeError(
-                "Mixed prefill/decode batches are not supported by ModelRunner yet"
-            )
-
-        has_partial_prefill = any(
-            item.is_prefill
-            and item.num_scheduled_tokens
-            != (
-                item.sequence.num_prompt_tokens
-                - item.sequence.num_computed_tokens
-            )
+        if any(
+            item.is_prefill != is_prefill
             for item in scheduled
-        )
-        if has_partial_prefill:
+        ):
             raise RuntimeError(
-                "Chunked prefill execution is not supported by ModelRunner yet"
+                "Mixed prefill/decode batches are not supported "
+                "by ModelRunner yet"
             )
 
-        scheduled_sequences = [item.sequence for item in scheduled]
+        sampling_sequences = [
+            item.sequence
+            for item in scheduled
+            if item.should_sample
+        ]
 
-        outputs = self.model_runner.call(
+        model_outputs = self.model_runner.call(
             "run",
             scheduled,
         )
 
-        if outputs is not None:
-            outputs = outputs.cpu().tolist()
+        if model_outputs is None:
+            sampled_token_ids = []
+        else:
+            sampled_token_ids = (
+                model_outputs.cpu().tolist()
+            )
 
-        # Commit progress only after model execution succeeds.
+        if (
+            len(sampled_token_ids)
+            != len(sampling_sequences)
+        ):
+            raise RuntimeError(
+                "ModelRunner sampled token count mismatch: "
+                f"expected {len(sampling_sequences)}, "
+                f"got {len(sampled_token_ids)}"
+            )
+
         for item in scheduled:
             item.sequence.advance_computed_tokens(
                 item.num_scheduled_tokens
             )
 
-        self.scheduler.postprocess(scheduled_sequences, outputs)
-
-        outputs = [
-            (seq.seq_id, seq.completion_token_ids)
-            for seq in scheduled_sequences
-            if seq.is_finished
-        ]
-        num_processed_tokens = sum(
-            item.num_scheduled_tokens for item in scheduled
+        self.scheduler.postprocess(
+            sampling_sequences,
+            sampled_token_ids,
         )
 
-        return outputs, num_processed_tokens, is_prefill
-    # add prompt string to the waiting queue by first transforming it to Sequence object
+        finished = [
+            (
+                seq.seq_id,
+                seq.completion_token_ids,
+            )
+            for seq in sampling_sequences
+            if seq.is_finished
+        ]
+
+        num_processed_tokens = sum(
+            item.num_scheduled_tokens
+            for item in scheduled
+        )
+
+        return (
+            finished,
+            num_processed_tokens,
+            is_prefill,
+        )
     def add_prompt(self, prompt: str, sampling_params: SamplingParams) -> None:
         self.scheduler.add_sequence(Sequence(token_ids=self.tokenizer.encode(prompt), block_size=self.config['block_size'],sampling_params=sampling_params))
 
