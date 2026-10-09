@@ -288,3 +288,199 @@ def test_run_model_copies_positions_into_cuda_graph_buffer():
     assert runner.graph_vars["positions"].tolist() == [4, 2]
     fake_graph.replay.assert_called_once_with()
     assert result is expected_logits
+class TestSampleLogitSelection:
+    def test_full_prefills_select_each_sequence_last_row(self):
+        first = make_sequence(
+            [1, 2, 3]
+        )
+        second = make_sequence(
+            [4, 5]
+        )
+        scheduled = [
+            ScheduledSequence(
+                sequence=first,
+                num_scheduled_tokens=3,
+                is_prefill=True,
+            ),
+            ScheduledSequence(
+                sequence=second,
+                num_scheduled_tokens=2,
+                is_prefill=True,
+            ),
+        ]
+
+        logits = torch.arange(
+            10,
+            dtype=torch.float32,
+        ).reshape(
+            5,
+            2,
+        )
+
+        selected = (
+            model_runner_module.select_sample_logits(
+                logits,
+                scheduled,
+            )
+        )
+
+        torch.testing.assert_close(
+            selected,
+            logits[[2, 4]],
+        )
+
+    def test_intermediate_prefill_is_skipped_without_losing_offsets(
+        self,
+    ):
+        intermediate = make_sequence(
+            [1, 2, 3, 4]
+        )
+        complete = make_sequence(
+            [5, 6, 7]
+        )
+        scheduled = [
+            ScheduledSequence(
+                sequence=intermediate,
+                num_scheduled_tokens=2,
+                is_prefill=True,
+            ),
+            ScheduledSequence(
+                sequence=complete,
+                num_scheduled_tokens=3,
+                is_prefill=True,
+            ),
+        ]
+
+        logits = torch.arange(
+            10,
+            dtype=torch.float32,
+        ).reshape(
+            5,
+            2,
+        )
+
+        selected = (
+            model_runner_module.select_sample_logits(
+                logits,
+                scheduled,
+            )
+        )
+
+        torch.testing.assert_close(
+            selected,
+            logits[4:5],
+        )
+
+    def test_final_resumed_prefill_selects_chunk_last_row(self):
+        seq = make_sequence(
+            [1, 2, 3, 4, 5, 6]
+        )
+        seq.advance_computed_tokens(4)
+
+        scheduled = [
+            ScheduledSequence(
+                sequence=seq,
+                num_scheduled_tokens=2,
+                is_prefill=True,
+            )
+        ]
+
+        logits = torch.arange(
+            6,
+            dtype=torch.float32,
+        ).reshape(
+            2,
+            3,
+        )
+
+        selected = (
+            model_runner_module.select_sample_logits(
+                logits,
+                scheduled,
+            )
+        )
+
+        torch.testing.assert_close(
+            selected,
+            logits[1:2],
+        )
+
+    def test_decode_selects_every_logit_row(self):
+        first = make_sequence(
+            [1, 2]
+        )
+        second = make_sequence(
+            [3, 4, 5]
+        )
+        first.advance_computed_tokens(
+            first.num_prompt_tokens
+        )
+        second.advance_computed_tokens(
+            second.num_prompt_tokens
+        )
+
+        scheduled = [
+            ScheduledSequence(
+                sequence=first,
+                num_scheduled_tokens=1,
+                is_prefill=False,
+            ),
+            ScheduledSequence(
+                sequence=second,
+                num_scheduled_tokens=1,
+                is_prefill=False,
+            ),
+        ]
+
+        logits = torch.arange(
+            8,
+            dtype=torch.float32,
+        ).reshape(
+            2,
+            4,
+        )
+
+        selected = (
+            model_runner_module.select_sample_logits(
+                logits,
+                scheduled,
+            )
+        )
+
+        torch.testing.assert_close(
+            selected,
+            logits,
+        )
+
+    def test_intermediate_prefill_returns_empty_logits(self):
+        seq = make_sequence(
+            [1, 2, 3, 4]
+        )
+        scheduled = [
+            ScheduledSequence(
+                sequence=seq,
+                num_scheduled_tokens=2,
+                is_prefill=True,
+            )
+        ]
+
+        logits = torch.arange(
+            6,
+            dtype=torch.float32,
+        ).reshape(
+            2,
+            3,
+        )
+
+        selected = (
+            model_runner_module.select_sample_logits(
+                logits,
+                scheduled,
+            )
+        )
+
+        assert selected.shape == (
+            0,
+            3,
+        )
+        assert selected.dtype == logits.dtype

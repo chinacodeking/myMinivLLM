@@ -14,6 +14,34 @@ from myvllm.engine.scheduler import ScheduledSequence
 from myvllm.engine.sequence import Sequence
 from myvllm.utils import *
 
+def select_sample_logits(
+    logits: torch.Tensor,
+    scheduled: list[ScheduledSequence],
+) -> torch.Tensor:
+    sample_row_indices = []
+    row_offset = 0
+
+    for item in scheduled:
+        row_offset += item.num_scheduled_tokens
+
+        if item.should_sample:
+            sample_row_indices.append(
+                row_offset - 1
+            )
+
+    if not sample_row_indices:
+        return logits[:0]
+
+    row_indices = torch.tensor(
+        sample_row_indices,
+        dtype=torch.long,
+        device=logits.device,
+    )
+    return logits.index_select(
+        0,
+        row_indices,
+    )
+
 class ModelRunner:
     def __init__(self, config: dict, rank: int, event: Event | list[Event]):
         self.config = config
