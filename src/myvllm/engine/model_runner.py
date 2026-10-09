@@ -396,6 +396,10 @@ class ModelRunner:
             vars = self.graph_vars
             # copy input data into graph variables
             vars['input_ids'][:bs].copy_(input_ids)
+
+            vars["positions"].zero_()
+            vars["positions"][:bs].copy_(context.positions)
+
             vars['slot_mapping'][:bs].fill_(-1)
             vars['slot_mapping'][:bs].copy_(context.slot_mapping)
             vars["context_lens"].zero_()
@@ -459,6 +463,12 @@ class ModelRunner:
         max_num_blocks = math.ceil(max_len / self.block_size)
         # for decoding, input is always of shape (batch_size, 1)
         input_ids = torch.zeros(max_bs, dtype=torch.long, device=f'cuda:{self.rank}')
+        positions = torch.zeros(
+            max_bs,
+            dtype=torch.long,
+            device=f"cuda:{self.rank}",
+        )
+
         # for paged attention
         # where to write new KV values in the cache
         slot_mapping = torch.zeros(max_bs, dtype=torch.long, device=f'cuda:{self.rank}')
@@ -485,6 +495,7 @@ class ModelRunner:
                 slot_mapping=slot_mapping[:batch_size],
                 context_lens=context_lens[:batch_size],
                 block_tables=block_tables[:batch_size],
+                positions=positions[:batch_size],
             )
             outputs[:batch_size] = self.model(input_ids[:batch_size])
 
@@ -505,4 +516,5 @@ class ModelRunner:
             context_lens=context_lens,
             block_tables=block_tables,
             outputs=outputs,
+            positions=positions,
         )

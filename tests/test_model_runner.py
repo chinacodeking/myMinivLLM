@@ -1,12 +1,14 @@
 from unittest.mock import MagicMock
 
 import pytest
+import torch
 
 from myvllm.engine import model_runner as model_runner_module
+from myvllm.engine.model_input import PrefillMetadata
 from myvllm.engine.model_runner import ModelRunner
 from myvllm.engine.scheduler import ScheduledSequence
 from myvllm.engine.sequence import Sequence
-from myvllm.engine.model_input import PrefillMetadata
+from myvllm.utils.context import reset_context, set_context
 
 def make_sequence(token_ids, block_size=4):
     return Sequence(
@@ -209,3 +211,80 @@ def test_prepare_decode_puts_last_token_positions_in_context(
 
     assert context_arguments["context_lens"].values == [5, 3]
     assert context_arguments["positions"].values == [4, 2]
+def test_run_model_copies_positions_into_cuda_graph_buffer():
+    runner = ModelRunner.__new__(ModelRunner)
+    runner.enforce_eager = False
+
+    fake_graph = MagicMock()
+    expected_logits = object()
+
+    runner.graphs = {
+        2: fake_graph,
+    }
+    runner.graph_vars = {
+        "input_ids": torch.zeros(
+            2,
+            dtype=torch.long,
+        ),
+        "positions": torch.full(
+            (2,),
+            -1,
+            dtype=torch.long,
+        ),
+        "slot_mapping": torch.zeros(
+            2,
+            dtype=torch.long,
+        ),
+        "context_lens": torch.zeros(
+            2,
+            dtype=torch.long,
+        ),
+        "block_tables": torch.zeros(
+            (2, 2),
+            dtype=torch.int32,
+        ),
+        "outputs": torch.zeros(
+            (2, 4),
+        ),
+    }
+
+    runner.model = MagicMock()
+    runner.model.compute_logits.return_value = expected_logits
+
+    set_context(
+        is_prefill=False,
+        positions=torch.tensor(
+            [4, 2],
+            dtype=torch.long,
+        ),
+        slot_mapping=torch.tensor(
+            [8, 18],
+            dtype=torch.long,
+        ),
+        context_lens=torch.tensor(
+            [5, 3],
+            dtype=torch.long,
+        ),
+        block_tables=torch.tensor(
+            [
+                [7, 2],
+                [4, -1],
+            ],
+            dtype=torch.int32,
+        ),
+    )
+
+    try:
+        result = runner.run_model(
+            torch.tensor(
+                [5, 10],
+                dtype=torch.long,
+            ),
+            is_prefill=False,
+        )
+    finally:
+        reset_context()
+
+    assert runner.graph_vars["positions"].tolist() == [4, 2]
+    fake_graph.replay.assert_called_once_with()
+    assert result is expected_logits
