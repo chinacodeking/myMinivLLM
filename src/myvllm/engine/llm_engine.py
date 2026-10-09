@@ -96,8 +96,7 @@ class LLMEngine:
 
         outputs = self.model_runner.call(
             "run",
-            scheduled_sequences,
-            is_prefill,
+            scheduled,
         )
 
         if outputs is not None:

@@ -9,6 +9,7 @@ from multiprocessing.shared_memory import SharedMemory
 from myvllm.models.qwen3 import Qwen3ForCausalLM
 from myvllm.models.llama import LlamaForCausalLM
 from myvllm.layers.sampler import SamplerLayer
+from myvllm.engine.scheduler import ScheduledSequence
 from myvllm.engine.sequence import Sequence
 from myvllm.utils import *
 
@@ -190,7 +191,15 @@ class ModelRunner:
         max_model_length = self.config['max_model_length']
         batch_size = max_tokens // max_model_length
         seqs = [Sequence(token_ids=[0]*max_model_length, block_size=self.config['block_size']) for _ in range(batch_size)]
-        self.run(seqs, is_prefill=True)
+        scheduled = [
+            ScheduledSequence(
+                sequence=seq,
+                num_scheduled_tokens=len(seq),
+                is_prefill=True,
+            )
+            for seq in seqs
+        ]
+        self.run(scheduled)
         torch.cuda.empty_cache()
 
     # allocate kv cache memory blocks for model
@@ -383,16 +392,36 @@ class ModelRunner:
     # run model
     # sample logits
     # reset context
-    def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
+    def run(
+        self,
+        scheduled: list[ScheduledSequence],
+    ) -> torch.Tensor | None:
+        if not scheduled:
+            return None
+
+        is_prefill = scheduled[0].is_prefill
+        if any(item.is_prefill != is_prefill for item in scheduled):
+            raise ValueError(
+                "ModelRunner requires a homogeneous prefill or decode batch"
+            )
+
+        seqs = [item.sequence for item in scheduled]
+
         if is_prefill:
             input_ids = self.prepare_prefill(seqs)
         else:
             input_ids = self.prepare_decode(seqs)
+
         logits = self.run_model(input_ids, is_prefill)
+
         # only sample when rank == 0
         token_ids = None
         if self.rank == 0:
-            token_ids = self.sampler(logits, self.prepare_sample(seqs))
+            token_ids = self.sampler(
+                logits,
+                self.prepare_sample(seqs),
+            )
+
         reset_context()
         return token_ids
 

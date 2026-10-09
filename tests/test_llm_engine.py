@@ -40,7 +40,7 @@ def test_step_rejects_partial_prefill_before_model_execution():
     assert seq.num_computed_tokens == 0
 
 
-def test_step_commits_progress_only_after_model_execution():
+def test_step_passes_work_and_commits_progress_after_model_execution():
     seq = make_sequence([1, 2, 3])
     scheduled = [
         ScheduledSequence(
@@ -54,10 +54,12 @@ def test_step_commits_progress_only_after_model_execution():
     model_outputs = MagicMock()
     model_outputs.cpu.return_value.tolist.return_value = [9]
 
-    def run_model(method_name, sequences, is_prefill):
+    def run_model(method_name, scheduled_work):
         assert method_name == "run"
-        assert sequences == [seq]
-        assert is_prefill
+        assert scheduled_work == scheduled
+        assert scheduled_work[0].sequence is seq
+        assert scheduled_work[0].num_scheduled_tokens == 3
+        assert scheduled_work[0].is_prefill
         assert seq.num_computed_tokens == 0
         return model_outputs
 
