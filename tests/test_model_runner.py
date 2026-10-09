@@ -10,6 +10,7 @@ from myvllm.engine.scheduler import ScheduledSequence
 from myvllm.engine.sequence import Sequence
 from myvllm.utils.context import reset_context, set_context
 
+
 def make_sequence(token_ids, block_size=4):
     return Sequence(
         token_ids=token_ids,
@@ -35,12 +36,11 @@ def test_run_reads_phase_and_sequences_from_scheduled_work():
     runner.rank = 0
 
     input_ids = object()
-    logits = torch.arange(
-        6,
+    logits = torch.tensor(
+        [
+            [4.0, 5.0],
+        ],
         dtype=torch.float32,
-    ).reshape(
-        3,
-        2,
     )
     temperatures = object()
     sampled_token_ids = object()
@@ -82,10 +82,12 @@ def test_run_reads_phase_and_sequences_from_scheduled_work():
 
     torch.testing.assert_close(
         sampled_logits,
-        logits[2:3],
+        logits,
     )
     assert sampled_temperatures is temperatures
     assert outputs is sampled_token_ids
+
+
 def test_prepare_prefill_builds_metadata_from_scheduled_work(
     monkeypatch,
 ):
@@ -121,6 +123,7 @@ def test_prepare_prefill_builds_metadata_from_scheduled_work(
 
     with pytest.raises(MetadataWasBuilt):
         runner.prepare_prefill(scheduled)
+
 
 def test_prepare_prefill_puts_absolute_positions_in_context(
     monkeypatch,
@@ -194,6 +197,8 @@ def test_prepare_prefill_puts_absolute_positions_in_context(
     context_arguments = fake_set_context.call_args.kwargs
 
     assert context_arguments["positions"].values == [4, 5]
+
+
 def test_prepare_decode_puts_last_token_positions_in_context(
     monkeypatch,
 ):
@@ -245,6 +250,8 @@ def test_prepare_decode_puts_last_token_positions_in_context(
 
     assert context_arguments["context_lens"].values == [5, 3]
     assert context_arguments["positions"].values == [4, 2]
+
+
 def test_run_model_copies_positions_into_cuda_graph_buffer():
     runner = ModelRunner.__new__(ModelRunner)
     runner.enforce_eager = False
@@ -322,14 +329,12 @@ def test_run_model_copies_positions_into_cuda_graph_buffer():
     assert runner.graph_vars["positions"].tolist() == [4, 2]
     fake_graph.replay.assert_called_once_with()
     assert result is expected_logits
+
+
 class TestSampleLogitSelection:
-    def test_full_prefills_select_each_sequence_last_row(self):
-        first = make_sequence(
-            [1, 2, 3]
-        )
-        second = make_sequence(
-            [4, 5]
-        )
+    def test_full_prefills_keep_each_sequence_logit_row(self):
+        first = make_sequence([1, 2, 3])
+        second = make_sequence([4, 5])
         scheduled = [
             ScheduledSequence(
                 sequence=first,
@@ -342,36 +347,27 @@ class TestSampleLogitSelection:
                 is_prefill=True,
             ),
         ]
-
-        logits = torch.arange(
-            10,
+        logits = torch.tensor(
+            [
+                [10.0, 11.0],
+                [20.0, 21.0],
+            ],
             dtype=torch.float32,
-        ).reshape(
-            5,
-            2,
         )
 
-        selected = (
-            model_runner_module.select_sample_logits(
-                logits,
-                scheduled,
-            )
+        selected = model_runner_module.select_sample_logits(
+            logits,
+            scheduled,
         )
 
         torch.testing.assert_close(
             selected,
-            logits[[2, 4]],
+            logits,
         )
 
-    def test_intermediate_prefill_is_skipped_without_losing_offsets(
-        self,
-    ):
-        intermediate = make_sequence(
-            [1, 2, 3, 4]
-        )
-        complete = make_sequence(
-            [5, 6, 7]
-        )
+    def test_intermediate_prefill_keeps_sequence_row_alignment(self):
+        intermediate = make_sequence([1, 2, 3, 4])
+        complete = make_sequence([5, 6, 7])
         scheduled = [
             ScheduledSequence(
                 sequence=intermediate,
@@ -384,54 +380,17 @@ class TestSampleLogitSelection:
                 is_prefill=True,
             ),
         ]
-
-        logits = torch.arange(
-            10,
+        logits = torch.tensor(
+            [
+                [10.0, 11.0],
+                [20.0, 21.0],
+            ],
             dtype=torch.float32,
-        ).reshape(
-            5,
-            2,
         )
 
-        selected = (
-            model_runner_module.select_sample_logits(
-                logits,
-                scheduled,
-            )
-        )
-
-        torch.testing.assert_close(
-            selected,
-            logits[4:5],
-        )
-
-    def test_final_resumed_prefill_selects_chunk_last_row(self):
-        seq = make_sequence(
-            [1, 2, 3, 4, 5, 6]
-        )
-        seq.advance_computed_tokens(4)
-
-        scheduled = [
-            ScheduledSequence(
-                sequence=seq,
-                num_scheduled_tokens=2,
-                is_prefill=True,
-            )
-        ]
-
-        logits = torch.arange(
-            6,
-            dtype=torch.float32,
-        ).reshape(
-            2,
-            3,
-        )
-
-        selected = (
-            model_runner_module.select_sample_logits(
-                logits,
-                scheduled,
-            )
+        selected = model_runner_module.select_sample_logits(
+            logits,
+            scheduled,
         )
 
         torch.testing.assert_close(
@@ -439,19 +398,42 @@ class TestSampleLogitSelection:
             logits[1:2],
         )
 
+    def test_final_resumed_prefill_keeps_its_logit_row(self):
+        seq = make_sequence([1, 2, 3, 4, 5, 6])
+        seq.advance_computed_tokens(4)
+        scheduled = [
+            ScheduledSequence(
+                sequence=seq,
+                num_scheduled_tokens=2,
+                is_prefill=True,
+            )
+        ]
+        logits = torch.tensor(
+            [
+                [10.0, 11.0, 12.0],
+            ],
+            dtype=torch.float32,
+        )
+
+        selected = model_runner_module.select_sample_logits(
+            logits,
+            scheduled,
+        )
+
+        torch.testing.assert_close(
+            selected,
+            logits,
+        )
+
     def test_decode_selects_every_logit_row(self):
-        first = make_sequence(
-            [1, 2]
-        )
-        second = make_sequence(
-            [3, 4, 5]
-        )
-        first.advance_computed_tokens(
-            first.num_prompt_tokens
-        )
-        second.advance_computed_tokens(
-            second.num_prompt_tokens
-        )
+        first = make_sequence([1, 2])
+        second = make_sequence([3, 4, 5])
+
+        for seq in (first, second):
+            seq.advance_computed_tokens(
+                seq.num_prompt_tokens
+            )
+            seq.append_token(9)
 
         scheduled = [
             ScheduledSequence(
@@ -465,20 +447,17 @@ class TestSampleLogitSelection:
                 is_prefill=False,
             ),
         ]
-
-        logits = torch.arange(
-            8,
+        logits = torch.tensor(
+            [
+                [10.0, 11.0],
+                [20.0, 21.0],
+            ],
             dtype=torch.float32,
-        ).reshape(
-            2,
-            4,
         )
 
-        selected = (
-            model_runner_module.select_sample_logits(
-                logits,
-                scheduled,
-            )
+        selected = model_runner_module.select_sample_logits(
+            logits,
+            scheduled,
         )
 
         torch.testing.assert_close(
@@ -487,9 +466,7 @@ class TestSampleLogitSelection:
         )
 
     def test_intermediate_prefill_returns_empty_logits(self):
-        seq = make_sequence(
-            [1, 2, 3, 4]
-        )
+        seq = make_sequence([1, 2, 3, 4])
         scheduled = [
             ScheduledSequence(
                 sequence=seq,
@@ -497,27 +474,53 @@ class TestSampleLogitSelection:
                 is_prefill=True,
             )
         ]
-
-        logits = torch.arange(
-            6,
+        logits = torch.tensor(
+            [
+                [10.0, 11.0, 12.0],
+            ],
             dtype=torch.float32,
-        ).reshape(
-            2,
-            3,
         )
 
-        selected = (
+        selected = model_runner_module.select_sample_logits(
+            logits,
+            scheduled,
+        )
+
+        assert selected.shape == (0, 3)
+        assert selected.dtype == logits.dtype
+        assert selected.device == logits.device
+
+    @pytest.mark.parametrize(
+        "num_rows",
+        [0, 2],
+    )
+    def test_rejects_wrong_number_of_logit_rows(
+        self,
+        num_rows,
+    ):
+        seq = make_sequence([1, 2, 3])
+        scheduled = [
+            ScheduledSequence(
+                sequence=seq,
+                num_scheduled_tokens=3,
+                is_prefill=True,
+            )
+        ]
+        logits = torch.zeros(
+            (num_rows, 3),
+            dtype=torch.float32,
+        )
+
+        with pytest.raises(
+            ValueError,
+            match="one logits row per scheduled sequence",
+        ):
             model_runner_module.select_sample_logits(
                 logits,
                 scheduled,
             )
-        )
 
-        assert selected.shape == (
-            0,
-            3,
-        )
-        assert selected.dtype == logits.dtype
+
 def test_run_samples_only_sequences_that_reach_sampling_boundary():
     intermediate = make_sequence(
         [1, 2, 3, 4]
@@ -547,12 +550,12 @@ def test_run_samples_only_sequences_that_reach_sampling_boundary():
         [1, 2, 5, 6, 7],
         dtype=torch.long,
     )
-    logits = torch.arange(
-        10,
+    logits = torch.tensor(
+        [
+            [2.0, 3.0],
+            [8.0, 9.0],
+        ],
         dtype=torch.float32,
-    ).reshape(
-        5,
-        2,
     )
     temperatures = torch.tensor(
         [0.7],
@@ -595,7 +598,7 @@ def test_run_samples_only_sequences_that_reach_sampling_boundary():
 
     torch.testing.assert_close(
         sampled_logits,
-        logits[4:5],
+        logits[1:2],
     )
     assert sampled_temperatures is temperatures
     assert result is sampled_tokens
@@ -622,12 +625,11 @@ def test_run_skips_sampler_for_intermediate_prefill():
         [1, 2],
         dtype=torch.long,
     )
-    logits = torch.arange(
-        6,
+    logits = torch.tensor(
+        [
+            [3.0, 4.0, 5.0],
+        ],
         dtype=torch.float32,
-    ).reshape(
-        2,
-        3,
     )
 
     runner.prepare_prefill = MagicMock(

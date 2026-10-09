@@ -18,16 +18,20 @@ def select_sample_logits(
     logits: torch.Tensor,
     scheduled: list[ScheduledSequence],
 ) -> torch.Tensor:
-    sample_row_indices = []
-    row_offset = 0
+    expected_rows = len(scheduled)
+    actual_rows = logits.shape[0]
 
-    for item in scheduled:
-        row_offset += item.num_scheduled_tokens
+    if actual_rows != expected_rows:
+        raise ValueError(
+            "Expected one logits row per scheduled sequence: "
+            f"expected {expected_rows}, got {actual_rows}"
+        )
 
-        if item.should_sample:
-            sample_row_indices.append(
-                row_offset - 1
-            )
+    sample_row_indices = [
+        index
+        for index, item in enumerate(scheduled)
+        if item.should_sample
+    ]
 
     if not sample_row_indices:
         return logits[:0]
