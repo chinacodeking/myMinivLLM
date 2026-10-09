@@ -43,3 +43,73 @@ def test_gather_paged_kv_follows_logical_block_order():
         1.0,
         30.0,
     ]
+def test_paged_prefill_attends_to_prefix_with_absolute_causal_mask():
+    query = torch.zeros(
+        (2, 1, 1),
+        dtype=torch.float32,
+    )
+
+    k_cache = torch.zeros(
+        (2, 2, 1, 1),
+        dtype=torch.float32,
+    )
+
+    v_cache = torch.tensor(
+        [
+            [5.0, 7.0],
+            [1.0, 3.0],
+        ],
+        dtype=torch.float32,
+    ).reshape(
+        2,
+        2,
+        1,
+        1,
+    )
+
+    block_tables = torch.tensor(
+        [
+            [1, 0],
+        ],
+        dtype=torch.int32,
+    )
+
+    cu_seqlens_q = torch.tensor(
+        [0, 2],
+        dtype=torch.int32,
+    )
+    cu_seqlens_k = torch.tensor(
+        [0, 4],
+        dtype=torch.int32,
+    )
+    positions = torch.tensor(
+        [2, 3],
+        dtype=torch.long,
+    )
+
+    output = (
+        attention_module.paged_attention_prefill_reference(
+            query=query,
+            k_cache=k_cache,
+            v_cache=v_cache,
+            block_tables=block_tables,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            positions=positions,
+            scale=1.0,
+            block_size=2,
+        )
+    )
+
+    assert output.shape == (
+        2,
+        1,
+        1,
+    )
+    torch.testing.assert_close(
+        output[:, 0, 0],
+        torch.tensor(
+            [3.0, 4.0],
+            dtype=torch.float32,
+        ),
+    )

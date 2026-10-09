@@ -93,6 +93,215 @@ def gather_paged_kv(
         block_offsets,
     ]
 
+def paged_attention_prefill_reference(
+    query: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    block_tables: torch.Tensor,
+    cu_seqlens_q: torch.Tensor,
+    cu_seqlens_k: torch.Tensor,
+    positions: torch.Tensor,
+    scale: float,
+    block_size: int,
+) -> torch.Tensor:
+    if query.dim() != 3:
+        raise ValueError(
+            "query must have shape "
+            "(num_query_tokens, num_heads, head_dim)"
+        )
+
+    if k_cache.shape != v_cache.shape:
+        raise ValueError(
+            "K and V cache shapes must match"
+        )
+
+    if k_cache.dim() != 4:
+        raise ValueError(
+            "K and V caches must be four-dimensional"
+        )
+
+    if block_tables.dim() != 2:
+        raise ValueError(
+            "block_tables must be two-dimensional"
+        )
+
+    if cu_seqlens_q.dim() != 1:
+        raise ValueError(
+            "cu_seqlens_q must be one-dimensional"
+        )
+
+    if cu_seqlens_k.dim() != 1:
+        raise ValueError(
+            "cu_seqlens_k must be one-dimensional"
+        )
+
+    if cu_seqlens_q.numel() != cu_seqlens_k.numel():
+        raise ValueError(
+            "Query and KV sequence counts must match"
+        )
+
+    if positions.numel() != query.shape[0]:
+        raise ValueError(
+            "positions must contain one entry per query token"
+        )
+
+    tensors = (
+        k_cache,
+        v_cache,
+        block_tables,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        positions,
+    )
+    if any(
+        tensor.device != query.device
+        for tensor in tensors
+    ):
+        raise ValueError(
+            "All attention tensors must be on the same device"
+        )
+
+    num_sequences = cu_seqlens_q.numel() - 1
+    if block_tables.shape[0] != num_sequences:
+        raise ValueError(
+            "block_tables must contain one row per sequence"
+        )
+
+    num_heads = query.shape[1]
+    head_dim = query.shape[2]
+    num_kv_heads = k_cache.shape[2]
+
+    if k_cache.shape[3] != head_dim:
+        raise ValueError(
+            "Query and KV head dimensions must match"
+        )
+
+    if num_heads % num_kv_heads != 0:
+        raise ValueError(
+            "Query heads must be divisible by KV heads"
+        )
+
+    q_offsets = (
+        cu_seqlens_q
+        .detach()
+        .cpu()
+        .tolist()
+    )
+    k_offsets = (
+        cu_seqlens_k
+        .detach()
+        .cpu()
+        .tolist()
+    )
+
+    if q_offsets[-1] != query.shape[0]:
+        raise ValueError(
+            "cu_seqlens_q does not cover all query tokens"
+        )
+
+    outputs = []
+    heads_per_kv_head = num_heads // num_kv_heads
+
+    for sequence_index in range(num_sequences):
+        q_start = q_offsets[sequence_index]
+        q_end = q_offsets[sequence_index + 1]
+
+        context_start = k_offsets[sequence_index]
+        context_end = k_offsets[sequence_index + 1]
+        context_len = context_end - context_start
+
+        sequence_query = query[
+            q_start:q_end
+        ]
+        sequence_positions = positions[
+            q_start:q_end
+        ]
+
+        logical_k = gather_paged_kv(
+            cache=k_cache,
+            block_table=block_tables[sequence_index],
+            context_len=context_len,
+            block_size=block_size,
+        )
+        logical_v = gather_paged_kv(
+            cache=v_cache,
+            block_table=block_tables[sequence_index],
+            context_len=context_len,
+            block_size=block_size,
+        )
+
+        if heads_per_kv_head > 1:
+            logical_k = logical_k.repeat_interleave(
+                heads_per_kv_head,
+                dim=1,
+            )
+            logical_v = logical_v.repeat_interleave(
+                heads_per_kv_head,
+                dim=1,
+            )
+
+        query_by_head = (
+            sequence_query
+            .transpose(0, 1)
+            .float()
+        )
+        key_by_head = (
+            logical_k
+            .transpose(0, 1)
+            .float()
+        )
+        value_by_head = (
+            logical_v
+            .transpose(0, 1)
+            .float()
+        )
+
+        scores = torch.matmul(
+            query_by_head,
+            key_by_head.transpose(-1, -2),
+        )
+        scores = scores * scale
+
+        key_positions = torch.arange(
+            context_len,
+            dtype=torch.long,
+            device=query.device,
+        )
+        causal_mask = (
+            key_positions.unsqueeze(0)
+            <= sequence_positions.unsqueeze(1)
+        )
+
+        scores = scores.masked_fill(
+            ~causal_mask.unsqueeze(0),
+            torch.finfo(scores.dtype).min,
+        )
+
+        probabilities = torch.softmax(
+            scores,
+            dim=-1,
+        )
+
+        sequence_output = torch.matmul(
+            probabilities,
+            value_by_head,
+        )
+        sequence_output = (
+            sequence_output
+            .transpose(0, 1)
+            .to(dtype=query.dtype)
+        )
+        outputs.append(sequence_output)
+
+    if not outputs:
+        return torch.empty_like(query)
+
+    return torch.cat(
+        outputs,
+        dim=0,
+    )
+
+
 @triton.jit
 def store_kvcache_kernel(
     key_ptr, # pointer to what we want to store
