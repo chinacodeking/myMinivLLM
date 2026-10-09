@@ -60,65 +60,137 @@ class Scheduler:
 
 
     def schedule(self) -> list[ScheduledSequence]:
-        scheduled_sequences: list[Sequence] = []
+        scheduled: list[ScheduledSequence] = []
+        scheduled_decode_sequences: list[Sequence] = []
+
         current_scheduled_tokens = 0
         preempted = False
 
-        scheduled_prefills: list[ScheduledSequence] = []
+        # Decode has priority so that an arriving long prompt does not
+        # delay requests that are already generating tokens.
+        num_running_sequences = len(self.running)
 
-        # Resume prompts that were partially computed in an earlier step.
-        for seq in self.running:
-            if len(scheduled_prefills) >= self.max_num_sequences:
+        for _ in range(num_running_sequences):
+            if (
+                current_scheduled_tokens
+                >= self.max_num_batched_tokens
+                or len(scheduled)
+                >= self.max_num_sequences
+            ):
                 break
 
-            remaining_budget = (
-                self.max_num_batched_tokens - current_scheduled_tokens
+            seq = self.running.popleft()
+
+            # A sequence whose prompt is not fully computed still needs
+            # prefill work. Put it back for the prefill pass below.
+            if (
+                seq.num_computed_tokens
+                < seq.num_prompt_tokens
+            ):
+                self.running.append(seq)
+                continue
+
+            # Decode processes one token. If that token crosses a block
+            # boundary, the block manager may need another physical block.
+            if not self.block_manager.can_append(seq):
+                preempted = True
+
+                if self.running:
+                    self.running.appendleft(seq)
+                    self.preempt(self.running.pop())
+                else:
+                    self.preempt(seq)
+                    break
+
+                continue
+
+            self.block_manager.append(seq)
+
+            scheduled_decode_sequences.append(seq)
+            scheduled.append(
+                ScheduledSequence(
+                    sequence=seq,
+                    num_scheduled_tokens=1,
+                    is_prefill=False,
+                )
             )
-            if remaining_budget <= 0:
+            current_scheduled_tokens += 1
+
+        # Decode sequences remain active after this step, so restore them
+        # to the running queue in their original scheduled order.
+        if scheduled_decode_sequences:
+            self.running.extendleft(
+                reversed(scheduled_decode_sequences)
+            )
+
+        # Use the remaining token budget to resume prompts that were
+        # partially computed in earlier steps.
+        for seq in self.running:
+            if (
+                current_scheduled_tokens
+                >= self.max_num_batched_tokens
+                or len(scheduled)
+                >= self.max_num_sequences
+            ):
                 break
 
             num_uncomputed_prompt_tokens = (
-                seq.num_prompt_tokens - seq.num_computed_tokens
+                seq.num_prompt_tokens
+                - seq.num_computed_tokens
             )
+
             if num_uncomputed_prompt_tokens <= 0:
                 continue
 
+            remaining_budget = (
+                self.max_num_batched_tokens
+                - current_scheduled_tokens
+            )
             num_scheduled_tokens = min(
                 num_uncomputed_prompt_tokens,
                 remaining_budget,
             )
-            scheduled_prefills.append(
+
+            scheduled.append(
                 ScheduledSequence(
                     sequence=seq,
-                    num_scheduled_tokens=num_scheduled_tokens,
+                    num_scheduled_tokens=(
+                        num_scheduled_tokens
+                    ),
                     is_prefill=True,
                 )
             )
-            current_scheduled_tokens += num_scheduled_tokens
+            current_scheduled_tokens += (
+                num_scheduled_tokens
+            )
 
-        if scheduled_prefills:
-            return scheduled_prefills
-
-        # Admit new prompts from the waiting queue.
+        # If capacity is still available, admit new prompts from the
+        # waiting queue and give them the remaining token budget.
         while (
             self.waiting
-            and len(scheduled_prefills) < self.max_num_sequences
-            and current_scheduled_tokens < self.max_num_batched_tokens
+            and current_scheduled_tokens
+            < self.max_num_batched_tokens
+            and len(scheduled)
+            < self.max_num_sequences
         ):
             seq = self.waiting[0]
+
             if not self.block_manager.can_allocate(seq):
                 break
 
             remaining_budget = (
-                self.max_num_batched_tokens - current_scheduled_tokens
+                self.max_num_batched_tokens
+                - current_scheduled_tokens
             )
             num_uncomputed_prompt_tokens = (
-                seq.num_prompt_tokens - seq.num_computed_tokens
+                seq.num_prompt_tokens
+                - seq.num_computed_tokens
             )
             num_scheduled_tokens = min(
                 num_uncomputed_prompt_tokens,
                 remaining_budget,
             )
+
             if num_scheduled_tokens <= 0:
                 break
 
@@ -127,64 +199,36 @@ class Scheduler:
             seq.status = SequenceStatus.RUNNING
             self.running.append(seq)
 
-            scheduled_prefills.append(
+            scheduled.append(
                 ScheduledSequence(
                     sequence=seq,
-                    num_scheduled_tokens=num_scheduled_tokens,
+                    num_scheduled_tokens=(
+                        num_scheduled_tokens
+                    ),
                     is_prefill=True,
                 )
             )
-            current_scheduled_tokens += num_scheduled_tokens
+            current_scheduled_tokens += (
+                num_scheduled_tokens
+            )
 
-        if scheduled_prefills:
-            return scheduled_prefills
-
-        # try schedule for completion from running queue
-        while self.running:
-            seq = self.running.popleft()
-            # use can_append to check whether we can append one more token
-            if not self.block_manager.can_append(seq):
-                preempted = True
-                if self.running:
-                    self.running.appendleft(seq)
-                    self.preempt(self.running.pop())
-                else:
-                    self.preempt(seq)
-                    break
-            else:
-                if current_scheduled_tokens >= self.max_num_batched_tokens or len(scheduled_sequences) >= self.max_num_sequences:
-                    self.running.appendleft(seq)
-                    break
-                # append one token
-                self.block_manager.append(seq)
-                scheduled_sequences.append(seq)
-                current_scheduled_tokens += 1 # only one token for completion
-
-        # re-add to running queue in the same order
-        if scheduled_sequences:
-            self.running.extendleft(reversed(scheduled_sequences))
-        elif not preempted and (self.waiting or self.running):
-            # Nothing was scheduled and nothing was preempted, so no engine state
-            # changed: every later schedule() would take the same decisions and
-            # LLMEngine.generate() would spin forever. Fail loudly instead.
+        if (
+            not scheduled
+            and not preempted
+            and (self.waiting or self.running)
+        ):
             raise RuntimeError(
                 "Scheduler made no progress: "
-                f"{len(self.waiting)} waiting and {len(self.running)} running sequences, "
+                f"{len(self.waiting)} waiting and "
+                f"{len(self.running)} running sequences, "
                 f"{len(self.block_manager.free_block_ids)} of "
                 f"{len(self.block_manager.blocks)} blocks free. "
-                "This means either a sequence that cannot fit in the KV cache, or "
-                "blocks leaked because their ref_count never returned to 0."
+                "This means either a sequence that cannot fit "
+                "in the KV cache, or blocks leaked because their "
+                "ref_count never returned to 0."
             )
 
-        return [
-            ScheduledSequence(
-                sequence=seq,
-                num_scheduled_tokens=1,
-                is_prefill=False,
-            )
-            for seq in scheduled_sequences
-        ]
-
+        return scheduled
 
     def preempt(self, seq: Sequence) -> None:
         self.block_manager.deallocate(seq)

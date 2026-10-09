@@ -309,3 +309,49 @@ class TestSchedulerHappyPath:
         assert item.sequence is seq
         assert item.num_scheduled_tokens == 4
         assert item.is_prefill
+class TestMixedScheduling:
+    def test_decode_gets_one_token_while_new_prefill_uses_remaining_budget(
+        self,
+    ):
+        scheduler = make_scheduler(
+            max_num_batched_tokens=4,
+            max_num_sequences=2,
+            max_cached_blocks=10,
+            block_size=4,
+        )
+
+        decoding = make_sequence(
+            [1, 2, 3, 4],
+            block_size=4,
+        )
+        scheduler.add_sequence(decoding)
+
+        # 先完成这个请求的提示词，并产生第一个输出 token。
+        first_batch = scheduler.schedule()
+        assert len(first_batch) == 1
+        assert first_batch[0].is_prefill
+
+        decoding.advance_computed_tokens(4)
+        scheduler.postprocess([decoding], [99])
+        assert decoding.num_uncomputed_tokens == 1
+
+        # 此时老请求等待 Decode，新请求等待 Prefill。
+        incoming = make_sequence(
+            [10, 11, 12, 13, 14, 15],
+            block_size=4,
+        )
+        scheduler.add_sequence(incoming)
+
+        scheduled = scheduler.schedule()
+
+        assert [
+            (
+                item.sequence,
+                item.is_prefill,
+                item.num_scheduled_tokens,
+            )
+            for item in scheduled
+        ] == [
+            (decoding, False, 1),
+            (incoming, True, 3),
+        ]
