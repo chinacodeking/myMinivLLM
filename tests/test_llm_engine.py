@@ -1,4 +1,4 @@
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, call
 import torch
 import pytest
 
@@ -193,3 +193,75 @@ def test_step_rejects_sampled_token_count_mismatch():
 
     assert seq.num_computed_tokens == 0
     engine.scheduler.postprocess.assert_not_called()
+def test_step_dispatches_mixed_work_as_homogeneous_model_calls():
+    decoding = make_sequence(
+        [1, 2, 3, 4],
+        block_size=4,
+    )
+    decoding.advance_computed_tokens(
+        decoding.num_prompt_tokens
+    )
+    decoding.append_token(99)
+
+    incoming = make_sequence(
+        [10, 11, 12, 13, 14, 15],
+        block_size=4,
+    )
+
+    scheduled = [
+        ScheduledSequence(
+            sequence=decoding,
+            num_scheduled_tokens=1,
+            is_prefill=False,
+        ),
+        ScheduledSequence(
+            sequence=incoming,
+            num_scheduled_tokens=3,
+            is_prefill=True,
+        ),
+    ]
+
+    engine = make_engine(scheduled)
+
+    decode_outputs = torch.tensor(
+        [77],
+        dtype=torch.long,
+    )
+    intermediate_prefill_outputs = torch.empty(
+        0,
+        dtype=torch.long,
+    )
+
+    engine.model_runner.call.side_effect = [
+        decode_outputs,
+        intermediate_prefill_outputs,
+    ]
+
+    (
+        finished,
+        num_processed,
+        is_prefill,
+    ) = engine.step()
+
+    assert engine.model_runner.call.call_args_list == [
+        call(
+            "run",
+            [scheduled[0]],
+        ),
+        call(
+            "run",
+            [scheduled[1]],
+        ),
+    ]
+
+    engine.scheduler.postprocess.assert_called_once_with(
+        [decoding],
+        [77],
+    )
+
+    assert decoding.num_computed_tokens == 5
+    assert incoming.num_computed_tokens == 3
+
+    assert finished == []
+    assert num_processed == 4
+    assert is_prefill is None

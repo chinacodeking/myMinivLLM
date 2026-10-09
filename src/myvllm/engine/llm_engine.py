@@ -67,51 +67,86 @@ class LLMEngine:
     # call postprocessor to process the outputs and update sequences and update block manager
     def step(
         self,
-    ) -> tuple[list[tuple[int, list[int]]], int, bool]:
+    ) -> tuple[
+        list[tuple[int, list[int]]],
+        int,
+        bool | None,
+    ]:
         scheduled = self.scheduler.schedule()
         num_processed_tokens = 0
 
         if not scheduled:
             return [], num_processed_tokens, False
 
-        is_prefill = scheduled[0].is_prefill
-        if any(
-            item.is_prefill != is_prefill
+        decode_work = [
+            item
             for item in scheduled
-        ):
-            raise RuntimeError(
-                "Mixed prefill/decode batches are not supported "
-                "by ModelRunner yet"
-            )
-
-        sampling_sequences = [
-            item.sequence
+            if not item.is_prefill
+        ]
+        prefill_work = [
+            item
             for item in scheduled
-            if item.should_sample
+            if item.is_prefill
         ]
 
-        model_outputs = self.model_runner.call(
-            "run",
-            scheduled,
-        )
+        work_groups = [
+            work_group
+            for work_group in (
+                decode_work,
+                prefill_work,
+            )
+            if work_group
+        ]
 
-        if model_outputs is None:
-            sampled_token_ids = []
-        else:
-            sampled_token_ids = (
-                model_outputs.cpu().tolist()
+        sampling_sequences = []
+        sampled_token_ids = []
+
+        # ModelRunner still requires a homogeneous batch.
+        # Execute Decode first, then Prefill, within one engine step.
+        for work_group in work_groups:
+            group_sampling_sequences = [
+                item.sequence
+                for item in work_group
+                if item.should_sample
+            ]
+
+            model_outputs = self.model_runner.call(
+                "run",
+                work_group,
             )
 
-        if (
-            len(sampled_token_ids)
-            != len(sampling_sequences)
-        ):
-            raise RuntimeError(
-                "ModelRunner sampled token count mismatch: "
-                f"expected {len(sampling_sequences)}, "
-                f"got {len(sampled_token_ids)}"
+            if model_outputs is None:
+                group_sampled_token_ids = []
+            else:
+                group_sampled_token_ids = (
+                    model_outputs.cpu().tolist()
+                )
+
+            if (
+                len(group_sampled_token_ids)
+                != len(group_sampling_sequences)
+            ):
+                phase = (
+                    "prefill"
+                    if work_group[0].is_prefill
+                    else "decode"
+                )
+                raise RuntimeError(
+                    "ModelRunner sampled token count mismatch "
+                    f"for {phase}: expected "
+                    f"{len(group_sampling_sequences)}, "
+                    f"got {len(group_sampled_token_ids)}"
+                )
+
+            sampling_sequences.extend(
+                group_sampling_sequences
+            )
+            sampled_token_ids.extend(
+                group_sampled_token_ids
             )
 
+        # Do not commit Sequence progress until every model call
+        # in this engine step has completed successfully.
         for item in scheduled:
             item.sequence.advance_computed_tokens(
                 item.num_scheduled_tokens
@@ -136,6 +171,14 @@ class LLMEngine:
             for item in scheduled
         )
 
+        has_decode = bool(decode_work)
+        has_prefill = bool(prefill_work)
+
+        if has_decode and has_prefill:
+            is_prefill = None
+        else:
+            is_prefill = has_prefill
+
         return (
             finished,
             num_processed_tokens,
@@ -157,10 +200,19 @@ class LLMEngine:
             outputs, num_processed_tokens, is_prefill = self.step()
             end_t = time.time()
             running_time = end_t - start_t + 1e-10
-            if is_prefill:
-                print(num_processed_tokens, 'number of processed tokens', num_processed_tokens/running_time, "tokens/sec during prefilling")
+            if is_prefill is True:
+                phase = "prefilling"
+            elif is_prefill is False:
+                phase = "decoding"
             else:
-                print(num_processed_tokens, 'number of processed tokens', num_processed_tokens/running_time, "tokens/sec during decoding")
+                phase = "mixed prefilling/decoding"
+
+            print(
+                num_processed_tokens,
+                "number of processed tokens",
+                num_processed_tokens / running_time,
+                f"tokens/sec during {phase}",
+            )
             generated_tokens.update({seq_id: tokens for seq_id, tokens in outputs})
 
         generated_tokens = [generated_tokens[seq_id] for seq_id in sorted(generated_tokens.keys())]
