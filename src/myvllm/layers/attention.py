@@ -789,16 +789,75 @@ class Attention(nn.Module):
         scale = self.scale / (self.head_dim ** 0.5)
 
         if context.is_prefill:
-            # Prefill: use flash attention
-            # Varlen mode: (total_tokens, num_heads, head_dim)
-            cu_seqlens = context.cu_seqlens_q
-            if cu_seqlens is None:
-                raise ValueError("cu_seqlens_q must be provided for varlen attention")
-            
-            o = flash_attention_prefill(q, k, v, cu_seqlens, scale, 
-                                        self.num_heads, self.num_kv_heads, self.head_dim)
-            # Output: (total_tokens, num_heads, head_dim) -> (total_tokens, num_heads * head_dim)
-            return o.reshape(o.shape[0], self.num_heads * self.head_dim)
+            cu_seqlens_q = context.cu_seqlens_q
+            cu_seqlens_k = context.cu_seqlens_k
+
+            if cu_seqlens_q is None:
+                raise ValueError(
+                    "cu_seqlens_q must be provided "
+                    "for prefill attention"
+                )
+
+            if cu_seqlens_k is None:
+                raise ValueError(
+                    "cu_seqlens_k must be provided "
+                    "for prefill attention"
+                )
+
+            use_paged_prefill = not torch.equal(
+                cu_seqlens_q,
+                cu_seqlens_k,
+            )
+
+            if use_paged_prefill:
+                if context.block_tables is None:
+                    raise ValueError(
+                        "block_tables must be provided "
+                        "for paged prefill attention"
+                    )
+
+                if context.positions is None:
+                    raise ValueError(
+                        "positions must be provided "
+                        "for paged prefill attention"
+                    )
+
+                if (
+                    k_cache.numel() == 0
+                    or v_cache.numel() == 0
+                ):
+                    raise ValueError(
+                        "KV cache must be allocated "
+                        "for paged prefill attention"
+                    )
+
+                o = paged_attention_prefill_reference(
+                    query=q,
+                    k_cache=k_cache,
+                    v_cache=v_cache,
+                    block_tables=context.block_tables,
+                    cu_seqlens_q=cu_seqlens_q,
+                    cu_seqlens_k=cu_seqlens_k,
+                    positions=context.positions,
+                    scale=scale,
+                    block_size=self.block_size,
+                )
+            else:
+                o = flash_attention_prefill(
+                    q,
+                    k,
+                    v,
+                    cu_seqlens_q,
+                    scale,
+                    self.num_heads,
+                    self.num_kv_heads,
+                    self.head_dim,
+                )
+
+            return o.reshape(
+                o.shape[0],
+                self.num_heads * self.head_dim,
+            )
         else:
             o = paged_attention_decode(
                 q, 
