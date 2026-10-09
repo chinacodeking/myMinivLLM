@@ -4,6 +4,95 @@ from myvllm.utils import get_context
 import torch
 import torch.nn as nn
 
+def gather_paged_kv(
+    cache: torch.Tensor,
+    block_table: torch.Tensor,
+    context_len: int,
+    block_size: int,
+) -> torch.Tensor:
+    if cache.dim() != 4:
+        raise ValueError(
+            "cache must have shape "
+            "(num_blocks, block_size, num_kv_heads, head_dim)"
+        )
+
+    if block_table.dim() != 1:
+        raise ValueError(
+            "block_table must be one-dimensional"
+        )
+
+    if context_len < 0:
+        raise ValueError(
+            "context_len must not be negative"
+        )
+
+    if block_size <= 0:
+        raise ValueError(
+            "block_size must be positive"
+        )
+
+    if cache.shape[1] != block_size:
+        raise ValueError(
+            "cache block size does not match block_size"
+        )
+
+    if cache.device != block_table.device:
+        raise ValueError(
+            "cache and block_table must be on the same device"
+        )
+
+    max_context_len = block_table.numel() * block_size
+    if context_len > max_context_len:
+        raise ValueError(
+            "block_table cannot cover context_len"
+        )
+
+    if context_len == 0:
+        return cache.new_empty(
+            (
+                0,
+                cache.shape[2],
+                cache.shape[3],
+            )
+        )
+
+    logical_positions = torch.arange(
+        context_len,
+        dtype=torch.long,
+        device=block_table.device,
+    )
+
+    logical_blocks = torch.div(
+        logical_positions,
+        block_size,
+        rounding_mode="floor",
+    )
+    block_offsets = torch.remainder(
+        logical_positions,
+        block_size,
+    )
+
+    physical_blocks = block_table[
+        logical_blocks
+    ].to(
+        dtype=torch.long,
+    )
+
+    if physical_blocks.lt(0).any():
+        raise ValueError(
+            "block_table contains an invalid physical block"
+        )
+
+    if physical_blocks.ge(cache.shape[0]).any():
+        raise ValueError(
+            "block_table references a block outside the cache"
+        )
+
+    return cache[
+        physical_blocks,
+        block_offsets,
+    ]
+
 @triton.jit
 def store_kvcache_kernel(
     key_ptr, # pointer to what we want to store
