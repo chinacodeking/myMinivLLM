@@ -11,7 +11,23 @@ class ScheduledSequence:
 
     def __post_init__(self):
         if self.num_scheduled_tokens <= 0:
-            raise ValueError("num_scheduled_tokens must be positive")
+            raise ValueError(
+                "num_scheduled_tokens must be positive"
+            )
+
+    @property
+    def should_sample(self) -> bool:
+        if not self.is_prefill:
+            return True
+
+        computed_after_step = (
+            self.sequence.num_computed_tokens
+            + self.num_scheduled_tokens
+        )
+        return (
+            computed_after_step
+            == self.sequence.num_prompt_tokens
+        )
 
 
 class Scheduler:

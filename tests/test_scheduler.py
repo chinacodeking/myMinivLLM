@@ -5,7 +5,10 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 import pytest
 from collections import deque
 from unittest.mock import MagicMock
-from myvllm.engine.scheduler import Scheduler
+from myvllm.engine.scheduler import (
+    ScheduledSequence,
+    Scheduler,
+)
 from myvllm.engine.sequence import Sequence, SequenceStatus
 
 
@@ -48,6 +51,63 @@ def schedule_sequences(scheduler: Scheduler):
     sequences = [item.sequence for item in scheduled]
     is_prefill = scheduled[0].is_prefill if scheduled else False
     return sequences, is_prefill
+
+
+class TestScheduledSequenceSampling:
+    def test_intermediate_prefill_does_not_sample(self):
+        seq = make_sequence(
+            [1, 2, 3, 4, 5, 6]
+        )
+        item = ScheduledSequence(
+            sequence=seq,
+            num_scheduled_tokens=4,
+            is_prefill=True,
+        )
+
+        assert not item.should_sample
+
+    def test_single_full_prefill_samples(self):
+        seq = make_sequence(
+            [1, 2, 3]
+        )
+        item = ScheduledSequence(
+            sequence=seq,
+            num_scheduled_tokens=3,
+            is_prefill=True,
+        )
+
+        assert item.should_sample
+
+    def test_final_resumed_prefill_chunk_samples(self):
+        seq = make_sequence(
+            [1, 2, 3, 4, 5, 6]
+        )
+        seq.advance_computed_tokens(4)
+
+        item = ScheduledSequence(
+            sequence=seq,
+            num_scheduled_tokens=2,
+            is_prefill=True,
+        )
+
+        assert item.should_sample
+
+    def test_decode_always_samples(self):
+        seq = make_sequence(
+            [1, 2, 3]
+        )
+        seq.advance_computed_tokens(
+            seq.num_prompt_tokens
+        )
+
+        item = ScheduledSequence(
+            sequence=seq,
+            num_scheduled_tokens=1,
+            is_prefill=False,
+        )
+
+        assert item.should_sample
+
 
 class TestBug2TokenLimitBreak:
     """
