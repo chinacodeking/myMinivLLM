@@ -1,5 +1,8 @@
 from unittest.mock import MagicMock
 
+import pytest
+
+from myvllm.engine import model_runner as model_runner_module
 from myvllm.engine.model_runner import ModelRunner
 from myvllm.engine.scheduler import ScheduledSequence
 from myvllm.engine.sequence import Sequence
@@ -38,7 +41,7 @@ def test_run_reads_phase_and_sequences_from_scheduled_work():
 
     outputs = runner.run(scheduled)
 
-    runner.prepare_prefill.assert_called_once_with([seq])
+    runner.prepare_prefill.assert_called_once_with(scheduled)
     runner.prepare_decode.assert_not_called()
     runner.run_model.assert_called_once_with(input_ids, True)
     runner.prepare_sample.assert_called_once_with([seq])
@@ -47,3 +50,38 @@ def test_run_reads_phase_and_sequences_from_scheduled_work():
         temperatures,
     )
     assert outputs is sampled_token_ids
+def test_prepare_prefill_builds_metadata_from_scheduled_work(
+    monkeypatch,
+):
+    seq = make_sequence([1, 2, 3])
+    scheduled = [
+        ScheduledSequence(
+            sequence=seq,
+            num_scheduled_tokens=3,
+            is_prefill=True,
+        )
+    ]
+
+    runner = ModelRunner.__new__(ModelRunner)
+    runner.block_size = 4
+
+    class MetadataWasBuilt(Exception):
+        pass
+
+    def fake_build_prefill_metadata(
+        actual_scheduled,
+        block_size,
+    ):
+        assert actual_scheduled is scheduled
+        assert block_size == 4
+        raise MetadataWasBuilt
+
+    monkeypatch.setattr(
+        model_runner_module,
+        "build_prefill_metadata",
+        fake_build_prefill_metadata,
+        raising=False,
+    )
+
+    with pytest.raises(MetadataWasBuilt):
+        runner.prepare_prefill(scheduled)

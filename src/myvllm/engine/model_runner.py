@@ -9,6 +9,7 @@ from multiprocessing.shared_memory import SharedMemory
 from myvllm.models.qwen3 import Qwen3ForCausalLM
 from myvllm.models.llama import LlamaForCausalLM
 from myvllm.layers.sampler import SamplerLayer
+from myvllm.engine.model_input import build_prefill_metadata
 from myvllm.engine.scheduler import ScheduledSequence
 from myvllm.engine.sequence import Sequence
 from myvllm.utils import *
@@ -271,55 +272,59 @@ class ModelRunner:
     #               │  │  └──── end of seq2 (position 5)
     #               │  └─────── end of seq1 (position 3)
     #               └────────── start (position 0)
-    def prepare_prefill(self, seqs: list[Sequence]) -> torch.Tensor:
-        # length: sum of all input_ids after prefix cache
-        input_ids = []
-        # length: sum of all input_ids after prefix cache
-        slot_mappings = []
-        # length: num_seqs
-        seqlens_q = []
-        # length: num_seqs
-        seqlens_k = []
-        # length: num_seqs + 1
-        cu_seqlens_q = [0]
-        # length: num_seqs + 1
-        cu_seqlens_k = [0]
-        # block_tables: num_seqs x num_blocks (padded)
-        block_tables = []
-        for seq in seqs:
-            token_ids = seq.token_ids
-            num_cached_tokens = seq.num_cached_tokens
-            input_ids.extend(token_ids[num_cached_tokens:])
-            seqlens_q.append(len(token_ids) - num_cached_tokens)
-            seqlens_k.append(len(token_ids))
-            cu_seqlens_q.append(cu_seqlens_q[-1] + seqlens_q[-1])
-            cu_seqlens_k.append(cu_seqlens_k[-1] + seqlens_k[-1])
-            if seq.block_table:
-                for i, block_id in enumerate(seq.block_table[seq.num_cached_blocks:]):
-                    if seq.num_cached_blocks + i != seq.num_blocks - 1:
-                        slot_mappings.extend(list(range(block_id * self.block_size, (block_id+1) * self.block_size)))
-                    else:
-                        slot_mappings.extend(list(range(block_id * self.block_size, block_id * self.block_size + seq.last_block_num_tokens)))
-        if cu_seqlens_q[-1] < cu_seqlens_k[-1]:
-            # pad block_tables
-            all_block_tables = [seq.block_table for seq in seqs]
-            max_num_blocks = max(len(bt) for bt in all_block_tables)
-            for i, seq in enumerate(seqs):
-                block_table = seq.block_table + [-1]*(max_num_blocks - len(seq.block_table))
-                block_tables.append(block_table)
-        input_ids = torch.tensor(input_ids, dtype=torch.long, pin_memory=True).cuda(non_blocking=True)
-        slot_mapping_tensor = torch.tensor(slot_mappings, dtype=torch.long, pin_memory=True).cuda(non_blocking=True)
+    def prepare_prefill(
+        self,
+        scheduled: list[ScheduledSequence],
+    ) -> torch.Tensor:
+        metadata = build_prefill_metadata(
+            scheduled,
+            block_size=self.block_size,
+        )
+
+        input_ids = torch.tensor(
+            metadata.input_ids,
+            dtype=torch.long,
+            pin_memory=True,
+        ).cuda(non_blocking=True)
+
+        slot_mapping = torch.tensor(
+            metadata.slot_mapping,
+            dtype=torch.long,
+            pin_memory=True,
+        ).cuda(non_blocking=True)
+
+        cu_seqlens_q = torch.tensor(
+            metadata.cu_seqlens_q,
+            dtype=torch.int32,
+            pin_memory=True,
+        ).cuda(non_blocking=True)
+
+        cu_seqlens_k = torch.tensor(
+            metadata.cu_seqlens_k,
+            dtype=torch.int32,
+            pin_memory=True,
+        ).cuda(non_blocking=True)
+
+        if metadata.block_tables:
+            block_tables = torch.tensor(
+                metadata.block_tables,
+                dtype=torch.int32,
+                pin_memory=True,
+            ).cuda(non_blocking=True)
+        else:
+            block_tables = None
 
         set_context(
             is_prefill=True,
-            cu_seqlens_q=torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True),
-            cu_seqlens_k=torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True),
-            max_seqlen_q=max(seqlens_q),
-            max_seqlen_k=max(seqlens_k),
-            slot_mapping=slot_mapping_tensor,
+            cu_seqlens_q=cu_seqlens_q,
+            cu_seqlens_k=cu_seqlens_k,
+            max_seqlen_q=max(metadata.seqlens_q),
+            max_seqlen_k=max(metadata.seqlens_k),
+            slot_mapping=slot_mapping,
             context_lens=None,
-            block_tables=torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True) if block_tables else None,
+            block_tables=block_tables,
         )
+
         return input_ids
 
 
@@ -408,7 +413,7 @@ class ModelRunner:
         seqs = [item.sequence for item in scheduled]
 
         if is_prefill:
-            input_ids = self.prepare_prefill(seqs)
+            input_ids = self.prepare_prefill(scheduled)
         else:
             input_ids = self.prepare_decode(seqs)
 
