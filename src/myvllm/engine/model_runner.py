@@ -287,6 +287,12 @@ class ModelRunner:
             pin_memory=True,
         ).cuda(non_blocking=True)
 
+        positions = torch.tensor(
+            metadata.positions,
+            dtype=torch.long,
+            pin_memory=True,
+        ).cuda(non_blocking=True)
+
         slot_mapping = torch.tensor(
             metadata.slot_mapping,
             dtype=torch.long,
@@ -323,6 +329,7 @@ class ModelRunner:
             slot_mapping=slot_mapping,
             context_lens=None,
             block_tables=block_tables,
+            positions=positions,
         )
 
         return input_ids

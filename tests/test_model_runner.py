@@ -6,7 +6,7 @@ from myvllm.engine import model_runner as model_runner_module
 from myvllm.engine.model_runner import ModelRunner
 from myvllm.engine.scheduler import ScheduledSequence
 from myvllm.engine.sequence import Sequence
-
+from myvllm.engine.model_input import PrefillMetadata
 
 def make_sequence(token_ids, block_size=4):
     return Sequence(
@@ -85,3 +85,76 @@ def test_prepare_prefill_builds_metadata_from_scheduled_work(
 
     with pytest.raises(MetadataWasBuilt):
         runner.prepare_prefill(scheduled)
+
+def test_prepare_prefill_puts_absolute_positions_in_context(
+    monkeypatch,
+):
+    seq = make_sequence([1, 2, 3, 4, 5, 6])
+    scheduled = [
+        ScheduledSequence(
+            sequence=seq,
+            num_scheduled_tokens=2,
+            is_prefill=True,
+        )
+    ]
+
+    metadata = PrefillMetadata(
+        input_ids=[5, 6],
+        positions=[4, 5],
+        slot_mapping=[8, 9],
+        seqlens_q=[2],
+        seqlens_k=[6],
+        cu_seqlens_q=[0, 2],
+        cu_seqlens_k=[0, 6],
+        block_tables=[[7, 2]],
+    )
+
+    runner = ModelRunner.__new__(ModelRunner)
+    runner.block_size = 4
+
+    class FakeTensor:
+        def __init__(
+            self,
+            values,
+            **kwargs,
+        ):
+            self.values = list(values)
+            self.options = kwargs
+
+        def cuda(self, non_blocking):
+            assert non_blocking
+            return self
+
+    def fake_build_prefill_metadata(
+        actual_scheduled,
+        block_size,
+    ):
+        assert actual_scheduled is scheduled
+        assert block_size == 4
+        return metadata
+
+    fake_set_context = MagicMock()
+
+    monkeypatch.setattr(
+        model_runner_module,
+        "build_prefill_metadata",
+        fake_build_prefill_metadata,
+    )
+    monkeypatch.setattr(
+        model_runner_module.torch,
+        "tensor",
+        FakeTensor,
+    )
+    monkeypatch.setattr(
+        model_runner_module,
+        "set_context",
+        fake_set_context,
+    )
+
+    input_ids = runner.prepare_prefill(scheduled)
+
+    assert input_ids.values == [5, 6]
+
+    context_arguments = fake_set_context.call_args.kwargs
+
+    assert context_arguments["positions"].values == [4, 5]
