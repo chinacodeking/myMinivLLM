@@ -152,3 +152,130 @@ def test_long_prompt_moves_through_three_prefill_steps():
         99
     ]
     assert engine.model_runner.call.call_count == 3
+def test_decode_and_new_prefill_share_one_engine_step():
+    scheduler = Scheduler(
+        max_num_sequences=2,
+        max_num_batched_tokens=4,
+        max_cached_blocks=10,
+        block_size=4,
+        eos=0,
+    )
+
+    decoding = make_sequence(
+        [1, 2, 3, 4],
+        block_size=4,
+    )
+    scheduler.add_sequence(decoding)
+
+    engine = LLMEngine.__new__(
+        LLMEngine
+    )
+    engine.scheduler = scheduler
+    engine.model_runner = MagicMock()
+
+    engine.model_runner.call.return_value = (
+        torch.tensor(
+            [99],
+            dtype=torch.long,
+        )
+    )
+
+    (
+        first_finished,
+        first_processed,
+        first_is_prefill,
+    ) = engine.step()
+
+    assert first_finished == []
+    assert first_processed == 4
+    assert first_is_prefill is True
+
+    assert decoding.num_computed_tokens == 4
+    assert decoding.completion_token_ids == [99]
+
+    incoming = make_sequence(
+        [10, 11, 12, 13, 14, 15],
+        block_size=4,
+    )
+    scheduler.add_sequence(incoming)
+
+    seen_work = []
+
+    def run_scheduled_work(
+        method_name,
+        scheduled,
+    ):
+        assert method_name == "run"
+
+        assert all(
+            item.is_prefill
+            == scheduled[0].is_prefill
+            for item in scheduled
+        )
+
+        seen_work.append(
+            [
+                (
+                    item.sequence,
+                    item.is_prefill,
+                    item.num_scheduled_tokens,
+                )
+                for item in scheduled
+            ]
+        )
+
+        if scheduled[0].is_prefill:
+            return torch.empty(
+                0,
+                dtype=torch.long,
+            )
+
+        return torch.tensor(
+            [77],
+            dtype=torch.long,
+        )
+
+    engine.model_runner.call.reset_mock()
+    engine.model_runner.call.side_effect = (
+        run_scheduled_work
+    )
+
+    (
+        mixed_finished,
+        mixed_processed,
+        mixed_is_prefill,
+    ) = engine.step()
+
+    assert seen_work == [
+        [
+            (
+                decoding,
+                False,
+                1,
+            )
+        ],
+        [
+            (
+                incoming,
+                True,
+                3,
+            )
+        ],
+    ]
+
+    assert mixed_finished == []
+    assert mixed_processed == 4
+    assert mixed_is_prefill is None
+
+    assert decoding.num_computed_tokens == 5
+    assert decoding.completion_token_ids == [
+        99,
+        77,
+    ]
+
+    assert incoming.num_computed_tokens == 3
+    assert incoming.completion_token_ids == []
+
+    assert decoding in scheduler.running
+    assert incoming in scheduler.running
+    assert not scheduler.waiting
