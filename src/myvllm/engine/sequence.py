@@ -30,6 +30,9 @@ class Sequence:
         # num_cached_tokens = 0
         self.num_cached_tokens = 0
         self.num_computed_tokens = 0
+        # KV eviction invalidates computed progress but not known token IDs.
+        # Recompute work must replay that full history before decoding resumes.
+        self.needs_recompute = False
         # block_table
         self.block_table = []
         # sampling_params' related things
@@ -102,6 +105,13 @@ class Sequence:
 
         self.num_computed_tokens = new_num_computed_tokens
 
+        if self.num_computed_tokens == self.num_tokens:
+            self.needs_recompute = False
+
+    def reset_computed_tokens(self) -> None:
+        self.num_computed_tokens = 0
+        self.needs_recompute = self.num_tokens > 0
+
     def __getstate__(self):
         return (
             self.block_size,
@@ -109,8 +119,12 @@ class Sequence:
             self.num_prompt_tokens,
             self.num_cached_tokens,
             self.num_computed_tokens,
+            self.needs_recompute,
             self.block_table,
-            self.token_ids if self.num_completion_tokens == 0 else self.last_token,
+            self.token_ids
+            if self.num_completion_tokens == 0
+            or self.needs_recompute
+            else self.last_token,
         )
 
     def __setstate__(self, state):
@@ -120,12 +134,16 @@ class Sequence:
             self.num_prompt_tokens,
             self.num_cached_tokens,
             self.num_computed_tokens,
+            self.needs_recompute,
             self.block_table,
             last_token_or_ids,
         ) = state
 
         num_completion_tokens = self.num_tokens - self.num_prompt_tokens
-        if num_completion_tokens == 0:
+        if (
+            num_completion_tokens == 0
+            or self.needs_recompute
+        ):
             self.token_ids = last_token_or_ids
         else:
             self.token_ids = [last_token_or_ids]

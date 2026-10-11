@@ -100,6 +100,10 @@ class TestScheduledSequenceSampling:
             seq.num_prompt_tokens
         )
 
+        # Prefill sampled token 9, but that token has not
+        # entered the model or produced KV state yet.
+        seq.append_token(9)
+
         item = ScheduledSequence(
             sequence=seq,
             num_scheduled_tokens=1,
@@ -355,3 +359,177 @@ class TestMixedScheduling:
             (decoding, False, 1),
             (incoming, True, 3),
         ]
+
+
+class TestPreemptionRecovery:
+    def test_preempt_invalidates_released_kv_progress(
+        self,
+    ):
+        scheduler = make_scheduler(
+            max_num_batched_tokens=4,
+            max_cached_blocks=4,
+            block_size=4,
+        )
+        seq = make_sequence(
+            [1, 2, 3, 4, 5, 6],
+            block_size=4,
+        )
+        scheduler.add_sequence(seq)
+
+        scheduled = scheduler.schedule()
+
+        assert len(scheduled) == 1
+        assert scheduled[0].sequence is seq
+        assert scheduled[0].is_prefill
+        assert (
+            scheduled[0].num_scheduled_tokens
+            == 4
+        )
+
+        seq.advance_computed_tokens(
+            scheduled[0].num_scheduled_tokens
+        )
+
+        assert seq.num_computed_tokens == 4
+        assert seq.block_table
+
+        # Scheduler.preempt() 的调用者会先把被抢占请求
+        # 从 running 队列中取出；这里模拟这个调用约定。
+        scheduler.running.remove(seq)
+        scheduler.preempt(seq)
+
+        assert seq.status is SequenceStatus.WAITING
+        assert seq in scheduler.waiting
+        assert seq not in scheduler.running
+
+        assert seq.block_table == []
+        assert seq.num_cached_tokens == 0
+
+        # KV 已全部释放，因此不能继续声称前 4 个 token
+        # 仍然拥有有效的计算结果。
+        assert seq.num_computed_tokens == 0
+        assert seq.needs_recompute
+
+    def test_preempted_sequence_replays_all_known_tokens(
+        self,
+    ):
+        scheduler = make_scheduler(
+            max_num_batched_tokens=4,
+            max_cached_blocks=4,
+            block_size=4,
+        )
+        seq = make_sequence(
+            [1, 2, 3, 4],
+            block_size=4,
+        )
+        scheduler.add_sequence(seq)
+
+        # 第一步：计算完整 prompt，并采样 token 9。
+        initial_prefill = scheduler.schedule()
+
+        assert [
+            (
+                item.sequence,
+                item.is_prefill,
+                item.num_scheduled_tokens,
+            )
+            for item in initial_prefill
+        ] == [
+            (seq, True, 4),
+        ]
+
+        seq.advance_computed_tokens(4)
+        scheduler.postprocess(
+            [seq],
+            [9],
+        )
+
+        # 第二步：Decode token 9，并采样 token 10。
+        first_decode = scheduler.schedule()
+
+        assert [
+            (
+                item.sequence,
+                item.is_prefill,
+                item.num_scheduled_tokens,
+                item.should_sample,
+            )
+            for item in first_decode
+        ] == [
+            (seq, False, 1, True),
+        ]
+
+        seq.advance_computed_tokens(1)
+        scheduler.postprocess(
+            [seq],
+            [10],
+        )
+
+        assert seq.prompt_token_ids == [
+            1,
+            2,
+            3,
+            4,
+        ]
+        assert seq.completion_token_ids == [
+            9,
+            10,
+        ]
+        assert seq.num_tokens == 6
+        assert seq.num_computed_tokens == 5
+
+        # KV 全部释放，但六个已知 token 必须保留。
+        scheduler.running.remove(seq)
+        scheduler.preempt(seq)
+
+        assert seq.token_ids == [
+            1,
+            2,
+            3,
+            4,
+            9,
+            10,
+        ]
+        assert seq.num_computed_tokens == 0
+        assert seq.needs_recompute
+
+        # 先重算 prompt。后面还有历史 token，不能采样。
+        first_replay = scheduler.schedule()
+
+        assert [
+            (
+                item.sequence,
+                item.is_prefill,
+                item.num_scheduled_tokens,
+                item.should_sample,
+            )
+            for item in first_replay
+        ] == [
+            (seq, True, 4, False),
+        ]
+
+        seq.advance_computed_tokens(4)
+
+        assert seq.num_computed_tokens == 4
+        assert seq.needs_recompute
+
+        # 再重算 completion 历史。追到前沿后才能采样。
+        final_replay = scheduler.schedule()
+
+        assert [
+            (
+                item.sequence,
+                item.is_prefill,
+                item.num_scheduled_tokens,
+                item.should_sample,
+            )
+            for item in final_replay
+        ] == [
+            (seq, True, 2, True),
+        ]
+
+        seq.advance_computed_tokens(2)
+
+        assert seq.num_computed_tokens == 6
+        assert seq.num_computed_tokens == seq.num_tokens
+        assert not seq.needs_recompute

@@ -17,16 +17,13 @@ class ScheduledSequence:
 
     @property
     def should_sample(self) -> bool:
-        if not self.is_prefill:
-            return True
-
         computed_after_step = (
             self.sequence.num_computed_tokens
             + self.num_scheduled_tokens
         )
         return (
             computed_after_step
-            == self.sequence.num_prompt_tokens
+            == self.sequence.num_tokens
         )
 
 
@@ -58,6 +55,14 @@ class Scheduler:
             )
         self.waiting.append(sequence)
 
+    @staticmethod
+    def _needs_prefill(seq: Sequence) -> bool:
+        return (
+            seq.needs_recompute
+            or seq.num_computed_tokens
+            < seq.num_prompt_tokens
+        )
+
 
     def schedule(self) -> list[ScheduledSequence]:
         scheduled: list[ScheduledSequence] = []
@@ -81,12 +86,9 @@ class Scheduler:
 
             seq = self.running.popleft()
 
-            # A sequence whose prompt is not fully computed still needs
-            # prefill work. Put it back for the prefill pass below.
-            if (
-                seq.num_computed_tokens
-                < seq.num_prompt_tokens
-            ):
+            # Incomplete prompts and preempted histories both need prefill
+            # work. Put them back for the prefill pass below.
+            if self._needs_prefill(seq):
                 self.running.append(seq)
                 continue
 
@@ -134,12 +136,14 @@ class Scheduler:
             ):
                 break
 
-            num_uncomputed_prompt_tokens = (
-                seq.num_prompt_tokens
-                - seq.num_computed_tokens
+            if not self._needs_prefill(seq):
+                continue
+
+            num_uncomputed_tokens = (
+                seq.num_uncomputed_tokens
             )
 
-            if num_uncomputed_prompt_tokens <= 0:
+            if num_uncomputed_tokens <= 0:
                 continue
 
             remaining_budget = (
@@ -147,7 +151,7 @@ class Scheduler:
                 - current_scheduled_tokens
             )
             num_scheduled_tokens = min(
-                num_uncomputed_prompt_tokens,
+                num_uncomputed_tokens,
                 remaining_budget,
             )
 
@@ -165,9 +169,13 @@ class Scheduler:
             )
 
         # If capacity is still available, admit new prompts from the
-        # waiting queue and give them the remaining token budget.
+        # waiting queue and give them the remaining token budget. After
+        # preemption, wait until the next schedule call before admitting
+        # waiting work so the released capacity remains available for the
+        # scheduling decision that caused the preemption.
         while (
             self.waiting
+            and not preempted
             and current_scheduled_tokens
             < self.max_num_batched_tokens
             and len(scheduled)
@@ -182,12 +190,11 @@ class Scheduler:
                 self.max_num_batched_tokens
                 - current_scheduled_tokens
             )
-            num_uncomputed_prompt_tokens = (
-                seq.num_prompt_tokens
-                - seq.num_computed_tokens
+            num_uncomputed_tokens = (
+                seq.num_uncomputed_tokens
             )
             num_scheduled_tokens = min(
-                num_uncomputed_prompt_tokens,
+                num_uncomputed_tokens,
                 remaining_budget,
             )
 
@@ -232,6 +239,7 @@ class Scheduler:
 
     def preempt(self, seq: Sequence) -> None:
         self.block_manager.deallocate(seq)
+        seq.reset_computed_tokens()
         seq.status = SequenceStatus.WAITING
         self.waiting.appendleft(seq)        
 

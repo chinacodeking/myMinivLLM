@@ -127,3 +127,61 @@ def test_computed_token_progress_survives_pickle_round_trip():
     assert restored.block_size == 4
     assert restored.num_computed_tokens == 2
     assert restored.num_uncomputed_tokens == 3
+
+
+def test_reset_computed_tokens_preserves_known_history():
+    seq = make_sequence(
+        [1, 2, 3, 4]
+    )
+
+    seq.advance_computed_tokens(4)
+    seq.append_token(9)
+    seq.advance_computed_tokens(1)
+    seq.append_token(10)
+
+    assert seq.token_ids == [
+        1,
+        2,
+        3,
+        4,
+        9,
+        10,
+    ]
+    assert seq.num_computed_tokens == 5
+
+    seq.reset_computed_tokens()
+
+    assert seq.token_ids == [
+        1,
+        2,
+        3,
+        4,
+        9,
+        10,
+    ]
+    assert seq.completion_token_ids == [
+        9,
+        10,
+    ]
+    assert seq.num_computed_tokens == 0
+    assert seq.num_uncomputed_tokens == 6
+    assert seq.needs_recompute
+
+
+def test_recompute_history_survives_pickle_round_trip():
+    seq = make_sequence(
+        [1, 2, 3, 4]
+    )
+    seq.advance_computed_tokens(4)
+    seq.append_token(9)
+    seq.advance_computed_tokens(1)
+    seq.append_token(10)
+    seq.reset_computed_tokens()
+
+    restored = pickle.loads(
+        pickle.dumps(seq)
+    )
+
+    assert restored.needs_recompute
+    assert restored.num_computed_tokens == 0
+    assert restored.token_ids == [1, 2, 3, 4, 9, 10]
