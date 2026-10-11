@@ -1,6 +1,6 @@
 import xxhash
 import numpy as np
-from collections import deque
+from collections import OrderedDict, deque
 
 from myvllm.engine.sequence import Sequence
 
@@ -37,6 +37,9 @@ class BlockManager:
         self.free_block_ids: deque[int] = deque(range(num_blocks))
         # used block ids
         self.used_block_ids: set[int] = set()
+        # Ready blocks with ref_count == 0, ordered from least to most
+        # recently used. They keep their KV contents until reused or evicted.
+        self.cached_block_ids: OrderedDict[int, None] = OrderedDict()
 
     # given token_ids, compute the hash value
     # use prefix_hash_value to compute the hash in a context-sensitive way
@@ -51,27 +54,77 @@ class BlockManager:
     def _allocate_block(self, block_id: int) -> Block:
         block = self.blocks[block_id]
         assert block.ref_count == 0, "Block is already allocated"
+        assert block_id in self.free_block_ids, "Block is not free"
         block.reset()
         self.free_block_ids.remove(block_id)
         self.used_block_ids.add(block_id)
         return block
 
-    def _deallocate_block(self, block_id: int) -> None:
-        assert self.blocks[block_id].ref_count == 0, "Block is still in use"
-        block = self.blocks[block_id]
+    def _clear_block_identity(self, block: Block) -> None:
         if (
             block.hash != -1
-            and self.hash_to_block_id.get(block.hash) == block_id
+            and self.hash_to_block_id.get(block.hash)
+            == block.block_id
         ):
             del self.hash_to_block_id[block.hash]
 
-        # This stage supports sharing ready blocks while at least one active
-        # sequence still owns them. Persistent, unreferenced prefix caching and
-        # eviction policy are deliberately left to the next stage.
         block.hash = -1
         block.token_ids = []
-        self.used_block_ids.remove(block_id)
+
+    def _free_block(self, block_id: int) -> None:
+        block = self.blocks[block_id]
+        assert block.ref_count == 0, "Block is still in use"
+
+        self.used_block_ids.discard(block_id)
+        self.cached_block_ids.pop(block_id, None)
+        self._clear_block_identity(block)
+
+        assert block_id not in self.free_block_ids
         self.free_block_ids.append(block_id)
+
+    def _deallocate_block(self, block_id: int) -> None:
+        assert self.blocks[block_id].ref_count == 0, "Block is still in use"
+        block = self.blocks[block_id]
+        is_reusable = (
+            block.hash != -1
+            and len(block.token_ids) == self.block_size
+            and self.hash_to_block_id.get(block.hash) == block_id
+        )
+
+        if not is_reusable:
+            self._free_block(block_id)
+            return
+
+        self.used_block_ids.remove(block_id)
+        self.cached_block_ids[block_id] = None
+        self.cached_block_ids.move_to_end(block_id)
+
+    def _activate_cached_block(self, block_id: int) -> Block:
+        block = self.blocks[block_id]
+        assert block.ref_count == 0, "Cached block is still in use"
+        assert block_id in self.cached_block_ids
+
+        del self.cached_block_ids[block_id]
+        block.ref_count = 1
+        self.used_block_ids.add(block_id)
+        return block
+
+    def _evict_oldest_cached_block(self) -> int:
+        if not self.cached_block_ids:
+            raise RuntimeError("No cached block is available for eviction")
+
+        block_id = next(iter(self.cached_block_ids))
+        self._free_block(block_id)
+        return block_id
+
+    def _allocate_new_block(self) -> Block:
+        if not self.free_block_ids:
+            self._evict_oldest_cached_block()
+
+        if not self.free_block_ids:
+            raise RuntimeError("No KV cache block is available")
+
+        return self._allocate_block(self.free_block_ids[0])
 
     def _find_cached_block(
         self,
@@ -88,7 +141,9 @@ class BlockManager:
         block = self.blocks[block_id]
         if (
             block_id not in self.used_block_ids
-            or block.hash != h
+            and block_id not in self.cached_block_ids
+        ) or (
+            block.hash != h
             or block.token_ids != token_ids
         ):
             return None
@@ -101,6 +156,10 @@ class BlockManager:
         h = -1
         prefix_cache_hit = True
         num_new_blocks = 0
+        num_reclaimable_blocks = (
+            len(self.free_block_ids)
+            + len(self.cached_block_ids)
+        )
 
         for i in range(seq.num_blocks):
             token_ids = seq.block(i)
@@ -123,8 +182,12 @@ class BlockManager:
             if block_id is None:
                 prefix_cache_hit = False
                 num_new_blocks += 1
+            elif block_id in self.cached_block_ids:
+                # A cached hit is no longer available to evict for a miss
+                # later in this same allocation plan.
+                num_reclaimable_blocks -= 1
 
-        return len(self.free_block_ids) >= num_new_blocks
+        return num_reclaimable_blocks >= num_new_blocks
 
     def allocate(self, seq: Sequence) -> None:
         if seq.block_table:
@@ -155,12 +218,15 @@ class BlockManager:
                 )
 
             if block_id is not None:
-                block = self.blocks[block_id]
-                block.ref_count += 1
+                if block_id in self.cached_block_ids:
+                    block = self._activate_cached_block(block_id)
+                else:
+                    block = self.blocks[block_id]
+                    block.ref_count += 1
                 seq.num_cached_tokens += self.block_size
             else:
                 prefix_cache_hit = False
-                block = self._allocate_block(self.free_block_ids[0])
+                block = self._allocate_new_block()
 
             seq.block_table.append(block.block_id)
 
@@ -220,9 +286,12 @@ class BlockManager:
         # condition must match append()'s allocation branch: a fresh block is only
         # needed when that token is the first of a new block (num_tokens % size == 1).
         # At num_tokens % size == 0 the token still fits in the block the sequence
-        # already holds, and append() merely finalizes its hash.
+        # already holds; mark_computed() publishes it after execution succeeds.
         if seq.num_tokens % self.block_size == 1:
-            return len(self.free_block_ids) > 0
+            return bool(
+                self.free_block_ids
+                or self.cached_block_ids
+            )
         return True
 
     # this is the actual work to append tokens to this sequence
@@ -238,7 +307,7 @@ class BlockManager:
         if seq.num_tokens % self.block_size == 1:
             # Previous block should be finalized
             assert self.blocks[last_block_for_seq_id].hash != -1
-            block = self._allocate_block(self.free_block_ids[0])
+            block = self._allocate_new_block()
             block_tables.append(block.block_id)
         else:
             assert last_block_for_seq_id in self.used_block_ids, "Last block should be allocated"

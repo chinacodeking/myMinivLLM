@@ -6,6 +6,19 @@ def make_sequence(token_ids, block_size=4):
     return Sequence(token_ids=token_ids, block_size=block_size)
 
 
+def release_ready_block(manager, token_ids):
+    seq = make_sequence(
+        token_ids,
+        block_size=manager.block_size,
+    )
+    manager.allocate(seq)
+    seq.advance_computed_tokens(len(token_ids))
+    manager.mark_computed(seq)
+    block_id = seq.block_table[0]
+    manager.deallocate(seq)
+    return block_id
+
+
 def test_can_allocate_checks_available_capacity():
     manager = BlockManager(num_blocks=2, block_size=4)
 
@@ -105,7 +118,7 @@ def test_identical_active_prefix_reuses_the_same_block():
     assert len(manager.free_block_ids) == 0
 
 
-def test_shared_block_is_freed_after_last_reference():
+def test_shared_block_is_cached_after_last_reference():
     manager = BlockManager(num_blocks=2, block_size=4)
     first = make_sequence([1, 2, 3, 4])
     second = make_sequence([1, 2, 3, 4])
@@ -126,7 +139,115 @@ def test_shared_block_is_freed_after_last_reference():
 
     assert manager.blocks[shared_block_id].ref_count == 0
     assert shared_block_id not in manager.used_block_ids
-    assert shared_block_id in manager.free_block_ids
+    assert shared_block_id not in manager.free_block_ids
+    assert shared_block_id in manager.cached_block_ids
+
+
+def test_released_computed_block_can_be_reused():
+    manager = BlockManager(num_blocks=1, block_size=4)
+    cached_block_id = release_ready_block(
+        manager,
+        [1, 2, 3, 4],
+    )
+
+    assert list(manager.cached_block_ids) == [
+        cached_block_id
+    ]
+    assert len(manager.free_block_ids) == 0
+
+    second = make_sequence([1, 2, 3, 4])
+
+    assert manager.can_allocate(second)
+    manager.allocate(second)
+
+    assert second.block_table == [cached_block_id]
+    assert second.num_cached_tokens == 4
+    assert manager.blocks[cached_block_id].ref_count == 1
+    assert cached_block_id in manager.used_block_ids
+    assert cached_block_id not in manager.cached_block_ids
+
+
+def test_lru_evicts_oldest_unreferenced_block():
+    manager = BlockManager(num_blocks=2, block_size=4)
+    oldest_block_id = release_ready_block(
+        manager,
+        [1, 2, 3, 4],
+    )
+    newest_block_id = release_ready_block(
+        manager,
+        [5, 6, 7, 8],
+    )
+
+    assert list(manager.cached_block_ids) == [
+        oldest_block_id,
+        newest_block_id,
+    ]
+    assert len(manager.free_block_ids) == 0
+
+    replacement = make_sequence([9, 10, 11, 12])
+    assert manager.can_allocate(replacement)
+    manager.allocate(replacement)
+
+    assert replacement.block_table == [
+        oldest_block_id
+    ]
+    assert list(manager.cached_block_ids) == [
+        newest_block_id
+    ]
+    assert manager.blocks[oldest_block_id].hash == -1
+
+
+def test_cache_hit_refreshes_lru_order():
+    manager = BlockManager(num_blocks=2, block_size=4)
+    first_block_id = release_ready_block(
+        manager,
+        [1, 2, 3, 4],
+    )
+    second_block_id = release_ready_block(
+        manager,
+        [5, 6, 7, 8],
+    )
+
+    reused = make_sequence([1, 2, 3, 4])
+    manager.allocate(reused)
+    manager.deallocate(reused)
+
+    assert list(manager.cached_block_ids) == [
+        second_block_id,
+        first_block_id,
+    ]
+
+    replacement = make_sequence([9, 10, 11, 12])
+    manager.allocate(replacement)
+
+    assert replacement.block_table == [
+        second_block_id
+    ]
+    assert list(manager.cached_block_ids) == [
+        first_block_id
+    ]
+
+
+def test_append_can_evict_cached_block_at_boundary():
+    manager = BlockManager(num_blocks=2, block_size=4)
+    cached_block_id = release_ready_block(
+        manager,
+        [1, 2, 3, 4],
+    )
+
+    active = make_sequence([5, 6, 7, 8])
+    manager.allocate(active)
+    active.advance_computed_tokens(4)
+    manager.mark_computed(active)
+
+    active.append_token(9)
+
+    assert manager.can_append(active)
+    manager.append(active)
+
+    assert active.block_table[-1] == cached_block_id
+    assert cached_block_id not in manager.cached_block_ids
+    assert cached_block_id in manager.used_block_ids
 
 
 def test_append_allocates_only_when_crossing_block_boundary():

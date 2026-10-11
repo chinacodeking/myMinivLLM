@@ -392,6 +392,8 @@ class TestPreemptionRecovery:
         seq.advance_computed_tokens(
             scheduled[0].num_scheduled_tokens
         )
+        scheduler.block_manager.mark_computed(seq)
+        ready_block_id = seq.block_table[0]
 
         assert seq.num_computed_tokens == 4
         assert seq.block_table
@@ -407,6 +409,15 @@ class TestPreemptionRecovery:
 
         assert seq.block_table == []
         assert seq.num_cached_tokens == 0
+
+        assert (
+            ready_block_id
+            in scheduler.block_manager.cached_block_ids
+        )
+        assert (
+            ready_block_id
+            not in scheduler.block_manager.free_block_ids
+        )
 
         # KV 已全部释放，因此不能继续声称前 4 个 token
         # 仍然拥有有效的计算结果。
@@ -499,8 +510,9 @@ class TestPreemptionRecovery:
         assert seq.num_computed_tokens == 0
         assert seq.needs_recompute
 
-        # 先重算 prompt。后面还有历史 token，不能采样。
-        first_replay = scheduler.schedule()
+        # 完整 prompt block 仍在持久缓存中，因此重新接纳后只需
+        # 重算 completion 历史 [9, 10]，不必再计算 [1, 2, 3, 4]。
+        replay = scheduler.schedule()
 
         assert [
             (
@@ -509,30 +521,13 @@ class TestPreemptionRecovery:
                 item.num_scheduled_tokens,
                 item.should_sample,
             )
-            for item in first_replay
-        ] == [
-            (seq, True, 4, False),
-        ]
-
-        seq.advance_computed_tokens(4)
-
-        assert seq.num_computed_tokens == 4
-        assert seq.needs_recompute
-
-        # 再重算 completion 历史。追到前沿后才能采样。
-        final_replay = scheduler.schedule()
-
-        assert [
-            (
-                item.sequence,
-                item.is_prefill,
-                item.num_scheduled_tokens,
-                item.should_sample,
-            )
-            for item in final_replay
+            for item in replay
         ] == [
             (seq, True, 2, True),
         ]
+
+        assert seq.num_cached_tokens == 4
+        assert seq.num_computed_tokens == 4
 
         seq.advance_computed_tokens(2)
 

@@ -5,6 +5,7 @@ import torch
 from myvllm.engine.llm_engine import LLMEngine
 from myvllm.engine.scheduler import Scheduler
 from myvllm.engine.sequence import Sequence
+from myvllm.sampling_parameters import SamplingParams
 
 
 def make_sequence(
@@ -409,3 +410,122 @@ def test_active_prefix_cache_skips_ready_full_blocks():
         second.block_table[0]
         == first.block_table[0]
     )
+
+
+def test_finished_request_prefix_cache_is_reused():
+    scheduler = Scheduler(
+        max_num_sequences=1,
+        max_num_batched_tokens=6,
+        max_cached_blocks=2,
+        block_size=4,
+        eos=0,
+    )
+
+    first = Sequence(
+        token_ids=[1, 2, 3, 4, 5, 6],
+        block_size=4,
+        sampling_params=SamplingParams(
+            max_tokens=1,
+        ),
+    )
+    scheduler.add_sequence(first)
+
+    engine = LLMEngine.__new__(
+        LLMEngine
+    )
+    engine.scheduler = scheduler
+    engine.model_runner = MagicMock()
+    engine.model_runner.call.return_value = (
+        torch.tensor(
+            [99],
+            dtype=torch.long,
+        )
+    )
+
+    (
+        first_finished,
+        first_processed,
+        first_is_prefill,
+    ) = engine.step()
+
+    assert first_finished == [
+        (
+            first.seq_id,
+            [99],
+        )
+    ]
+    assert first_processed == 6
+    assert first_is_prefill is True
+    assert scheduler.is_finished()
+
+    assert len(
+        scheduler.block_manager.cached_block_ids
+    ) == 1
+    cached_block_id = next(
+        iter(
+            scheduler.block_manager.cached_block_ids
+        )
+    )
+
+    second = make_sequence(
+        [1, 2, 3, 4, 5, 6],
+        block_size=4,
+    )
+    scheduler.add_sequence(second)
+
+    seen_work = []
+
+    def run_scheduled_work(
+        method_name,
+        scheduled,
+    ):
+        assert method_name == "run"
+        seen_work.append(
+            [
+                (
+                    item.sequence,
+                    item.num_scheduled_tokens,
+                    item.sequence.token_ids[
+                        item.sequence.num_computed_tokens:
+                        (
+                            item.sequence.num_computed_tokens
+                            + item.num_scheduled_tokens
+                        )
+                    ],
+                )
+                for item in scheduled
+            ]
+        )
+        return torch.tensor(
+            [88],
+            dtype=torch.long,
+        )
+
+    engine.model_runner.call.reset_mock()
+    engine.model_runner.call.side_effect = (
+        run_scheduled_work
+    )
+
+    (
+        second_finished,
+        second_processed,
+        second_is_prefill,
+    ) = engine.step()
+
+    assert seen_work == [
+        [
+            (
+                second,
+                2,
+                [5, 6],
+            )
+        ]
+    ]
+    assert second_finished == []
+    assert second_processed == 2
+    assert second_is_prefill is True
+
+    assert second.num_cached_tokens == 4
+    assert second.num_computed_tokens == 6
+    assert second.completion_token_ids == [88]
+    assert second.block_table[0] == cached_block_id
