@@ -279,3 +279,133 @@ def test_decode_and_new_prefill_share_one_engine_step():
     assert decoding in scheduler.running
     assert incoming in scheduler.running
     assert not scheduler.waiting
+
+
+def test_active_prefix_cache_skips_ready_full_blocks():
+    scheduler = Scheduler(
+        max_num_sequences=2,
+        max_num_batched_tokens=6,
+        max_cached_blocks=3,
+        block_size=4,
+        eos=0,
+    )
+
+    first = make_sequence(
+        [1, 2, 3, 4, 5, 6],
+        block_size=4,
+    )
+    scheduler.add_sequence(first)
+
+    engine = LLMEngine.__new__(
+        LLMEngine
+    )
+    engine.scheduler = scheduler
+    engine.model_runner = MagicMock()
+    engine.model_runner.call.return_value = (
+        torch.tensor(
+            [99],
+            dtype=torch.long,
+        )
+    )
+
+    (
+        first_finished,
+        first_processed,
+        first_is_prefill,
+    ) = engine.step()
+
+    assert first_finished == []
+    assert first_processed == 6
+    assert first_is_prefill is True
+    assert first.num_computed_tokens == 6
+    assert first.completion_token_ids == [99]
+
+    second = make_sequence(
+        [1, 2, 3, 4, 5, 6],
+        block_size=4,
+    )
+    scheduler.add_sequence(second)
+
+    seen_work = []
+
+    def run_scheduled_work(
+        method_name,
+        scheduled,
+    ):
+        assert method_name == "run"
+
+        seen_work.append(
+            [
+                (
+                    item.sequence,
+                    item.is_prefill,
+                    item.num_scheduled_tokens,
+                    item.sequence.token_ids[
+                        item.sequence.num_computed_tokens:
+                        (
+                            item.sequence.num_computed_tokens
+                            + item.num_scheduled_tokens
+                        )
+                    ],
+                )
+                for item in scheduled
+            ]
+        )
+
+        if scheduled[0].is_prefill:
+            return torch.tensor(
+                [88],
+                dtype=torch.long,
+            )
+
+        return torch.tensor(
+            [77],
+            dtype=torch.long,
+        )
+
+    engine.model_runner.call.reset_mock()
+    engine.model_runner.call.side_effect = (
+        run_scheduled_work
+    )
+
+    (
+        mixed_finished,
+        mixed_processed,
+        mixed_is_prefill,
+    ) = engine.step()
+
+    assert seen_work == [
+        [
+            (
+                first,
+                False,
+                1,
+                [99],
+            )
+        ],
+        [
+            (
+                second,
+                True,
+                2,
+                [5, 6],
+            )
+        ],
+    ]
+
+    assert mixed_finished == []
+    assert mixed_processed == 3
+    assert mixed_is_prefill is None
+
+    assert first.completion_token_ids == [
+        99,
+        77,
+    ]
+    assert second.completion_token_ids == [88]
+
+    assert second.num_cached_tokens == 4
+    assert second.num_computed_tokens == 6
+    assert (
+        second.block_table[0]
+        == first.block_table[0]
+    )

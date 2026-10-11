@@ -186,6 +186,25 @@ class Scheduler:
             if not self.block_manager.can_allocate(seq):
                 break
 
+            seq = self.waiting.popleft()
+            self.block_manager.allocate(seq)
+
+            # A fully cached prompt still needs its last token executed to
+            # produce the logits used for sampling. KV cache stores history,
+            # not the output logits of a previous request.
+            cached_computed_tokens = min(
+                seq.num_cached_tokens,
+                max(seq.num_tokens - 1, 0),
+            )
+            if (
+                cached_computed_tokens
+                > seq.num_computed_tokens
+            ):
+                seq.advance_computed_tokens(
+                    cached_computed_tokens
+                    - seq.num_computed_tokens
+                )
+
             remaining_budget = (
                 self.max_num_batched_tokens
                 - current_scheduled_tokens
@@ -199,10 +218,10 @@ class Scheduler:
             )
 
             if num_scheduled_tokens <= 0:
+                self.block_manager.deallocate(seq)
+                self.waiting.appendleft(seq)
                 break
 
-            seq = self.waiting.popleft()
-            self.block_manager.allocate(seq)
             seq.status = SequenceStatus.RUNNING
             self.running.append(seq)
 

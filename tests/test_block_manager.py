@@ -52,12 +52,48 @@ def test_deallocate_returns_blocks_to_pool():
         assert manager.blocks[block_id].ref_count == 0
 
 
-def test_identical_active_prefix_reuses_the_same_block():
+def test_uncomputed_block_is_not_exposed_as_cache_hit():
     manager = BlockManager(num_blocks=2, block_size=4)
     first = make_sequence([1, 2, 3, 4])
     second = make_sequence([1, 2, 3, 4])
 
     manager.allocate(first)
+    manager.allocate(second)
+
+    assert first.block_table != second.block_table
+    assert second.num_cached_tokens == 0
+
+
+def test_mark_computed_publishes_only_complete_blocks():
+    manager = BlockManager(num_blocks=2, block_size=4)
+    seq = make_sequence([1, 2, 3, 4, 5, 6])
+    manager.allocate(seq)
+
+    seq.advance_computed_tokens(3)
+    manager.mark_computed(seq)
+
+    assert manager.blocks[seq.block_table[0]].hash == -1
+    assert manager.blocks[seq.block_table[1]].hash == -1
+
+    seq.advance_computed_tokens(1)
+    manager.mark_computed(seq)
+
+    assert manager.blocks[seq.block_table[0]].hash != -1
+    assert manager.blocks[seq.block_table[1]].hash == -1
+
+
+def test_identical_active_prefix_reuses_the_same_block():
+    manager = BlockManager(num_blocks=1, block_size=4)
+    first = make_sequence([1, 2, 3, 4])
+    second = make_sequence([1, 2, 3, 4])
+
+    manager.allocate(first)
+    first.advance_computed_tokens(4)
+    manager.mark_computed(first)
+
+    assert len(manager.free_block_ids) == 0
+    assert manager.can_allocate(second)
+
     manager.allocate(second)
 
     shared_block_id = first.block_table[0]
@@ -66,7 +102,7 @@ def test_identical_active_prefix_reuses_the_same_block():
     assert second.num_cached_tokens == 4
     assert manager.blocks[shared_block_id].ref_count == 2
     assert manager.used_block_ids == {shared_block_id}
-    assert len(manager.free_block_ids) == 1
+    assert len(manager.free_block_ids) == 0
 
 
 def test_shared_block_is_freed_after_last_reference():
@@ -75,6 +111,8 @@ def test_shared_block_is_freed_after_last_reference():
     second = make_sequence([1, 2, 3, 4])
 
     manager.allocate(first)
+    first.advance_computed_tokens(4)
+    manager.mark_computed(first)
     manager.allocate(second)
     shared_block_id = first.block_table[0]
 
@@ -96,6 +134,8 @@ def test_append_allocates_only_when_crossing_block_boundary():
     seq = make_sequence([1, 2, 3, 4])
     manager.allocate(seq)
 
+    seq.advance_computed_tokens(4)
+    manager.mark_computed(seq)
     original_block_id = seq.block_table[0]
 
     seq.append_token(5)
@@ -107,6 +147,7 @@ def test_append_allocates_only_when_crossing_block_boundary():
 
     block_table_after_boundary = list(seq.block_table)
 
+    seq.advance_computed_tokens(1)
     seq.append_token(6)
     assert manager.can_append(seq)
     manager.append(seq)
@@ -119,6 +160,8 @@ def test_can_append_detects_exhaustion_at_block_boundary():
     seq = make_sequence([1, 2, 3, 4])
     manager.allocate(seq)
 
+    seq.advance_computed_tokens(4)
+    manager.mark_computed(seq)
     seq.append_token(5)
 
     assert not manager.can_append(seq)

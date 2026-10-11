@@ -336,6 +336,9 @@ class TestMixedScheduling:
         assert first_batch[0].is_prefill
 
         decoding.advance_computed_tokens(4)
+        scheduler.block_manager.mark_computed(
+            decoding
+        )
         scheduler.postprocess([decoding], [99])
         assert decoding.num_uncomputed_tokens == 1
 
@@ -439,6 +442,9 @@ class TestPreemptionRecovery:
         ]
 
         seq.advance_computed_tokens(4)
+        scheduler.block_manager.mark_computed(
+            seq
+        )
         scheduler.postprocess(
             [seq],
             [9],
@@ -533,3 +539,66 @@ class TestPreemptionRecovery:
         assert seq.num_computed_tokens == 6
         assert seq.num_computed_tokens == seq.num_tokens
         assert not seq.needs_recompute
+
+
+class TestPrefixCacheScheduling:
+    def test_full_prompt_cache_hit_recomputes_last_token(
+        self,
+    ):
+        scheduler = make_scheduler(
+            max_num_batched_tokens=4,
+            max_num_sequences=2,
+            max_cached_blocks=2,
+            block_size=4,
+        )
+
+        first = make_sequence(
+            [1, 2, 3, 4],
+            block_size=4,
+        )
+        scheduler.add_sequence(first)
+
+        initial = scheduler.schedule()
+        assert len(initial) == 1
+
+        first.advance_computed_tokens(4)
+        scheduler.block_manager.mark_computed(first)
+        scheduler.postprocess(
+            [first],
+            [9],
+        )
+
+        second = make_sequence(
+            [1, 2, 3, 4],
+            block_size=4,
+        )
+        scheduler.add_sequence(second)
+
+        scheduled = scheduler.schedule()
+
+        assert [
+            (
+                item.sequence,
+                item.is_prefill,
+                item.num_scheduled_tokens,
+                item.should_sample,
+            )
+            for item in scheduled
+        ] == [
+            (first, False, 1, True),
+            (second, True, 1, True),
+        ]
+
+        assert second.num_cached_tokens == 4
+        assert second.num_computed_tokens == 3
+        assert second.block_table == [
+            first.block_table[0]
+        ]
+
+        shared_block_id = second.block_table[0]
+        assert (
+            scheduler.block_manager
+            .blocks[shared_block_id]
+            .ref_count
+            == 2
+        )

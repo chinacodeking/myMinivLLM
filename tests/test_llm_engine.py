@@ -113,6 +113,11 @@ def test_step_passes_work_and_commits_progress_after_model_execution():
     assert outputs == []
     assert num_processed_tokens == 3
     assert is_prefill
+    engine.scheduler.block_manager.mark_computed.assert_called_once_with(
+        seq
+    )
+
+
 def test_step_advances_intermediate_prefill_without_sampling():
     seq = make_sequence(
         [1, 2, 3, 4]
@@ -193,6 +198,9 @@ def test_step_rejects_sampled_token_count_mismatch():
 
     assert seq.num_computed_tokens == 0
     engine.scheduler.postprocess.assert_not_called()
+    engine.scheduler.block_manager.mark_computed.assert_not_called()
+
+
 def test_step_dispatches_mixed_work_as_homogeneous_model_calls():
     decoding = make_sequence(
         [1, 2, 3, 4],

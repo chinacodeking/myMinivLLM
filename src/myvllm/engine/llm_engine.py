@@ -151,6 +151,9 @@ class LLMEngine:
             item.sequence.advance_computed_tokens(
                 item.num_scheduled_tokens
             )
+            self.scheduler.block_manager.mark_computed(
+                item.sequence
+            )
 
         self.scheduler.postprocess(
             sampling_sequences,

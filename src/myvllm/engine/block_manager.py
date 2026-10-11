@@ -59,58 +59,148 @@ class BlockManager:
     def _deallocate_block(self, block_id: int) -> None:
         assert self.blocks[block_id].ref_count == 0, "Block is still in use"
         block = self.blocks[block_id]
-        # Clearing token_ids deliberately keeps the prefix cache scoped to blocks that
-        # are still referenced: a freed block can no longer match in allocate(), so a
-        # cache hit never spans a finished sequence. Reuse across sequences is not
-        # enabled yet because the prefill path cannot consume it -- the Triton kernel
-        # in layers/attention.py attends only over the K/V computed in that pass and
-        # ignores context.block_tables, and qwen3 derives RoPE positions from
-        # cu_seqlens_q, so both would be wrong by num_cached_tokens. Enabling reuse
-        # means a paged prefill kernel (cu_seqlens_q != cu_seqlens_k) plus a position
-        # offset; until then this line is what keeps the engine correct.
+        if (
+            block.hash != -1
+            and self.hash_to_block_id.get(block.hash) == block_id
+        ):
+            del self.hash_to_block_id[block.hash]
+
+        # This stage supports sharing ready blocks while at least one active
+        # sequence still owns them. Persistent, unreferenced prefix caching and
+        # eviction policy are deliberately left to the next stage.
+        block.hash = -1
         block.token_ids = []
         self.used_block_ids.remove(block_id)
         self.free_block_ids.append(block_id)
 
-    # whether we can allocate a block for this sequence
-    def can_allocate(self, seq: Sequence) -> bool:
-        return len(self.free_block_ids) >= seq.num_blocks
+    def _find_cached_block(
+        self,
+        h: int,
+        token_ids: list[int],
+    ) -> int | None:
+        if h == -1:
+            return None
 
+        block_id = self.hash_to_block_id.get(h)
+        if block_id is None:
+            return None
+
+        block = self.blocks[block_id]
+        if (
+            block_id not in self.used_block_ids
+            or block.hash != h
+            or block.token_ids != token_ids
+        ):
+            return None
+
+        return block_id
+
+    # Count only physical blocks that are not already available as a
+    # contiguous, computed prefix.
+    def can_allocate(self, seq: Sequence) -> bool:
+        h = -1
+        prefix_cache_hit = True
+        num_new_blocks = 0
+
+        for i in range(seq.num_blocks):
+            token_ids = seq.block(i)
+
+            if len(token_ids) == self.block_size:
+                h = self.compute_hash(
+                    token_ids=token_ids,
+                    prefix_hash_value=h,
+                )
+            else:
+                h = -1
+
+            block_id = None
+            if prefix_cache_hit:
+                block_id = self._find_cached_block(
+                    h,
+                    token_ids,
+                )
+
+            if block_id is None:
+                prefix_cache_hit = False
+                num_new_blocks += 1
+
+        return len(self.free_block_ids) >= num_new_blocks
 
     def allocate(self, seq: Sequence) -> None:
+        if seq.block_table:
+            raise ValueError(
+                "Cannot allocate blocks for a sequence that already owns blocks"
+            )
+
+        seq.num_cached_tokens = 0
         h = -1
+        prefix_cache_hit = True
+
         for i in range(seq.num_blocks):
-            no_cache_found = False
-
             token_ids = seq.block(i)
-            # only compute hash for full blocks, always -1 for partial blocks
-            h = self.compute_hash(token_ids=token_ids, prefix_hash_value=h) if len(token_ids) == self.block_size else -1
-            block_id = self.hash_to_block_id.get(h, -1)
-            
-            # if cache miss or hash collision
-            if block_id == -1 or self.blocks[block_id].token_ids != token_ids:
-                no_cache_found = True
 
-            if not no_cache_found:
-                # update sequence information
-                seq.num_cached_tokens += self.block_size # which == len(token_ids)
-                # update block information, considering the edge case that the block is not allocated yet but with hash code
-                if block_id not in self.used_block_ids:
-                    # Unreachable while _deallocate_block clears token_ids: a freed
-                    # block has token_ids == [] and fails the match above. Kept for
-                    # when cross-sequence reuse is enabled.
-                    block = self._allocate_block(block_id)
-                else:
-                    # update block information
-                    block = self.blocks[self.hash_to_block_id[h]]
-                    block.ref_count += 1
+            if len(token_ids) == self.block_size:
+                h = self.compute_hash(
+                    token_ids=token_ids,
+                    prefix_hash_value=h,
+                )
             else:
-                # cache miss
+                h = -1
+
+            block_id = None
+            if prefix_cache_hit:
+                block_id = self._find_cached_block(
+                    h,
+                    token_ids,
+                )
+
+            if block_id is not None:
+                block = self.blocks[block_id]
+                block.ref_count += 1
+                seq.num_cached_tokens += self.block_size
+            else:
+                prefix_cache_hit = False
                 block = self._allocate_block(self.free_block_ids[0])
-                block.update(h=h, token_ids=token_ids)
-                if h != -1:
-                    self.hash_to_block_id[h] = block.block_id
+
             seq.block_table.append(block.block_id)
+
+    def mark_computed(self, seq: Sequence) -> None:
+        """Publish only full blocks whose KV values now exist."""
+        h = -1
+        num_computed_full_blocks = min(
+            seq.num_computed_tokens // self.block_size,
+            len(seq.block_table),
+        )
+
+        for i in range(num_computed_full_blocks):
+            token_ids = seq.block(i)
+            if len(token_ids) != self.block_size:
+                raise RuntimeError(
+                    "A computed full block must contain block_size tokens"
+                )
+
+            h = self.compute_hash(
+                token_ids=token_ids,
+                prefix_hash_value=h,
+            )
+            block_id = seq.block_table[i]
+            block = self.blocks[block_id]
+
+            if block.hash not in (-1, h):
+                raise RuntimeError(
+                    "Computed block identity changed while still allocated"
+                )
+
+            if block.token_ids and block.token_ids != token_ids:
+                raise RuntimeError(
+                    "Computed block tokens changed while still allocated"
+                )
+
+            block.update(
+                h=h,
+                token_ids=token_ids,
+            )
+            self.hash_to_block_id[h] = block_id
         
     def deallocate(self, seq: Sequence) -> None:
         # update block information
@@ -142,19 +232,14 @@ class BlockManager:
         block_tables = seq.block_table
         last_block_for_seq_id = block_tables[-1]
 
-        # if the last block is now full, compute hash
-        if seq.num_tokens % self.block_size == 0:
-            h = self.compute_hash(token_ids = seq.block(seq.num_blocks - 1), prefix_hash_value = -1 if len(block_tables) == 1 else self.blocks[block_tables[-2]].hash)
-            block = self.blocks[last_block_for_seq_id]
-            block.update(h=h, token_ids=seq.block(seq.num_blocks - 1))
-            self.hash_to_block_id[h] = block.block_id
-        # if one new block is needed
-        elif seq.num_tokens % self.block_size == 1:
+        # A sampled token is appended to Sequence before its KV is computed.
+        # Allocate storage here, but let mark_computed() publish the block only
+        # after model execution succeeds.
+        if seq.num_tokens % self.block_size == 1:
             # Previous block should be finalized
             assert self.blocks[last_block_for_seq_id].hash != -1
             block = self._allocate_block(self.free_block_ids[0])
             block_tables.append(block.block_id)
-        # else, do nothing
         else:
             assert last_block_for_seq_id in self.used_block_ids, "Last block should be allocated"
             assert self.blocks[last_block_for_seq_id].hash == -1, "Last block should be partial block with hash -1"
